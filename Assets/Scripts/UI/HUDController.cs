@@ -152,7 +152,9 @@ namespace ConcertDefense.UI
             switch (state)
             {
                 case GameState.Scanning:
-                    SetGuidance("Mueve el teléfono despacio apuntando a una mesa o al piso para detectar la superficie.");
+                    SetGuidance(Application.isEditor
+                        ? "Editor: apunta la cámara simulada a una superficie, o pulsa INICIAR OLEADA (o Espacio) para colocar el escenario."
+                        : "Mueve el teléfono despacio apuntando a una mesa o al piso para detectar la superficie.");
                     break;
 
                 case GameState.Placing:
@@ -166,12 +168,14 @@ namespace ConcertDefense.UI
                     break;
 
                 case GameState.GameOver:
+                    HideToast();
                     if (arGuidancePanel != null) arGuidancePanel.SetActive(false);
                     if (bossBarContainer != null) bossBarContainer.SetActive(false);
                     if (gameOverPanel != null) gameOverPanel.SetActive(true);
                     break;
 
                 case GameState.Victory:
+                    HideToast();
                     if (arGuidancePanel != null) arGuidancePanel.SetActive(false);
                     if (bossBarContainer != null) bossBarContainer.SetActive(false);
                     if (victoryPanel != null) victoryPanel.SetActive(true);
@@ -242,7 +246,8 @@ namespace ConcertDefense.UI
 
             if (startWaveLabel != null)
             {
-                if (waveActive) startWaveLabel.text = $"GLITCHES: {ws.ActiveEnemies}";
+                if (finished) startWaveLabel.text = "FIN DE LA PARTIDA";
+                else if (waveActive) startWaveLabel.text = $"GLITCHES: {ws.ActiveEnemies}";
                 else if (gm != null && !gm.IsPlaying && !finished) startWaveLabel.text = "INICIAR OLEADA";
                 else startWaveLabel.text = ws != null ? $"INICIAR OLEADA {Mathf.Min(ws.CurrentWaveIndex + 1, ws.TotalWaves)}" : "INICIAR OLEADA";
             }
@@ -317,9 +322,19 @@ namespace ConcertDefense.UI
 
         // ---------- Avisos ----------
 
+        private void HideToast()
+        {
+            toastTimer = 0f;
+            if (toastPanel != null) toastPanel.SetActive(false);
+        }
+
         public void ShowToast(string text, float seconds)
         {
             if (toastPanel == null || toastText == null) return;
+
+            // Con la partida terminada ya no se muestran avisos sobre el panel final
+            GameManager gm = GameManager.Instance;
+            if (gm != null && (gm.CurrentState == GameState.GameOver || gm.CurrentState == GameState.Victory)) return;
 
             toastText.text = text;
             toastPanel.SetActive(true);

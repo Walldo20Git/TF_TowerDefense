@@ -33,8 +33,8 @@ namespace ConcertDefense.Rhythm
         [SerializeField] private RectTransform pulseRing;
 
         [Header("Carga de Ultimate por acierto")]
-        [SerializeField] private float perfectChargeAmount = 0.06f;
-        [SerializeField] private float goodChargeAmount = 0.03f;
+        [SerializeField] private float perfectChargeAmount = 0.03f;
+        [SerializeField] private float goodChargeAmount = 0.015f;
 
         [Header("Paleta")]
         [SerializeField] private Color perfectColor = new Color(0f, 1f, 0.9f);
@@ -102,7 +102,9 @@ namespace ConcertDefense.Rhythm
         {
             if (!BeatClock.IsRunning)
             {
-                GameMessages.Show("El ritmo empieza cuando coloques el escenario.");
+                bool finished = GameManager.Instance != null &&
+                    (GameManager.Instance.CurrentState == GameState.GameOver || GameManager.Instance.CurrentState == GameState.Victory);
+                if (!finished) GameMessages.Show("El ritmo empieza cuando coloques el escenario.");
                 return;
             }
 
@@ -145,7 +147,7 @@ namespace ConcertDefense.Rhythm
         private void AddUltimateCharge(float baseAmount)
         {
             // El combo acumulado da un pequeño extra
-            float comboBonus = Mathf.Min(0.04f, currentCombo * 0.002f);
+            float comboBonus = Mathf.Min(0.015f, currentCombo * 0.001f);
             OnUltimateChargeGenerated?.Invoke(baseAmount + comboBonus);
         }
 

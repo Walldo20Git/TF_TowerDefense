@@ -94,11 +94,17 @@ namespace ConcertDefense.AR
 
             gm.ChangeState(placementPoseIsValid ? GameState.Placing : GameState.Scanning);
 
+            // Atajo del editor: Espacio coloca el campo aunque no haya plano
+            if (PointerInput.SpacePressed)
+            {
+                PlaceBattlefield();
+                return;
+            }
+
             if (!placementPoseIsValid) return;
 
-            // Un toque (fuera de la UI) fija el campo. Espacio hace lo mismo en el editor.
-            bool tapped = PointerInput.PrimaryDown(out Vector2 screenPosition) && !PointerInput.IsOverUI(screenPosition);
-            if (tapped || PointerInput.SpacePressed)
+            // Un toque (fuera de la UI) fija el campo
+            if (PointerInput.PrimaryDown(out Vector2 screenPosition) && !PointerInput.IsOverUI(screenPosition))
             {
                 PlaceBattlefield();
             }
@@ -188,6 +194,16 @@ namespace ConcertDefense.AR
         /// </summary>
         public bool PlaceBattlefield()
         {
+            // En el editor no hace falta esperar a un plano simulado: el campo se coloca delante de la cámara
+            if (!placementPoseIsValid && Application.isEditor && Camera.main != null)
+            {
+                Transform cam = Camera.main.transform;
+                Quaternion yaw = YawTowards(cam.forward);
+                placementPose = new Pose(cam.position + yaw * new Vector3(0f, -0.6f, 1.6f), yaw);
+                placementPoseIsValid = true;
+                fallbackMode = true;
+            }
+
             if (!placementPoseIsValid) return false;
 
             if (battlefieldPrefab == null)

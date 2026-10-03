@@ -280,25 +280,64 @@ Se define la organización modular de scripts en `Assets/Scripts/`:
 - **Atajo de Pruebas en Editor:**
   - Se agregó soporte para pulsar la tecla `Espacio` en el editor de Unity para fijar el escenario inmediatamente a 1.2 m sin requerir escaneo de cámara AR física.
 
+---
 
+### [2026-10-03] — Revisión completa: corrección de errores y cierre del GDD
 
+Se revisó todo el avance contra el GDD. Los scripts se reescribieron conservando nombres y carpetas; escena, prefabs, materiales y audio se regeneran con `ConcertDefense → Setup Complete Game` (`Assets/Scripts/Editor/GameSetupUtility.cs`), que se puede volver a ejecutar sin duplicar nada.
 
+#### Errores corregidos
+- **Paquetes:** `Packages/manifest.json` apuntaba a `com.coplaydev.unity-mcp` en `C:/Users/ADMIN/Downloads/...`, una ruta local de otro equipo. En cualquier otra PC fallaba la resolución de paquetes. Se quitó esa dependencia (no la usa el juego).
+- **HUD invisible al empezar:** `HUDController` desactivaba `GameplayHUD_Root` en `Awake` y en los estados `Scanning` y `Placing`. Ahora el HUD de juego (monedas, Ánimo, oleada, Iniciar oleada, Beat, Ultimate, Reubicar) está activo desde el primer fotograma; solo aparecen y desaparecen la guía AR, la barra de jefe, los avisos y los paneles de fin de partida.
+- **Botón Iniciar oleada:** siempre visible. Si el campo aún no está colocado, lo coloca; durante el combate muestra los glitches restantes.
+- **Campo guardado dentro de la escena:** había un `Battlefield(Clone)` desactivado y seis `MenuRoot` duplicados en `WorldSpace_TowerMenu`. El montaje limpia esos restos y el `Object Spawner` de la plantilla.
+- **Torres gratis y aplastadas:** `BuildSpot` leía `TotalInvestedCoins` del prefab (0 antes de `Awake`) y colgaba la torre de la plataforma, que tiene escala no uniforme. Ahora cobra `BaseCost` y la torre cuelga del contenedor `Towers`.
+- **Roller Coaster sin efecto:** la vía rodeaba el campo a 0.25 m de altura y nunca tocaba enemigos. Ahora baja de una estación elevada y recorre el camino de los glitches.
+- **Zonas de ruido sin efecto:** multiplicaban una velocidad que el proyectil reescribía cada fotograma. Ahora usan `Projectile.SpeedMultiplier`.
+- **Medidores sin relleno:** `Image.fillAmount` no hace nada sin sprite. Barras de Ánimo, jefe, vida y Ultimate usan relleno por anclas.
+- **Jefe que llega a la meta:** la barra superior no se ocultaba. `BossBase.OnBossDefeated` se emite también en ese caso.
+- **División de la Reina Glitch en `OnDestroy`:** creaba objetos al descargar la escena. Se movió a `OnRemovedFromField` y los esbirros se registran en `WaveSpawner`.
+- **Varios `MonoBehaviour` por archivo:** `NoiseZone` y `RollerCoasterCart` pasan a archivos propios.
+- **Caracteres sin glifo** (♪, ★) en botones: se quitaron.
+- **Oleadas y enemigos** no seguían el GDD (Static era lento y resistente). Se ajustaron a las tablas de las secciones 5 y 6.
 
+#### Decisiones técnicas
+- **Entrada:** `PointerInput` (Input System, `EnhancedTouch` + ratón) sustituye a `Input.*` y a `OnMouseDown`. `TouchInputRouter` hace el raycast propio que pide la sección 0 del GDD: torre → menú, plataforma → selector, pad → teletransporte, suelo → mover a la heroína. Funciona con *Active Input Handling* en *Both* o en *Input System*.
+- **Unidades de campo:** `Battlefield.Scale` convierte a metros. Velocidades, alcances y radios se expresan en unidades de campo, así que escalar o rotar el campo no descuadra el juego (GDD 4.1). El prefab mide 1.7 unidades y nace a escala 0.6 (≈ 1 m).
+- **Ritmo:** `BeatClock` emite `OnBeat` y `OnHalfBeat`. Cada torre dispara cada N medios tiempos (Treble 1, Bass y Echo 4, Drop 6). El botón Beat se evalúa al apoyar el dedo (`PointerDownRelay`), no al soltar. Perfect da ×1.5 de daño durante un tiempo.
+- **Física:** proyectiles con `Rigidbody` y trigger; el empuje de Drop y del carrito vuelve dinámico el `Rigidbody` del enemigo durante 0.35 s.
+- **Sin AR:** en el editor (o en un dispositivo sin ARCore) `ARPlacementController` entra en modo de prueba, con cámara fija y el campo en el origen. Atajos: clic o Espacio colocan el campo, Enter inicia oleada, B es el botón Beat, rueda escala y clic derecho rota.
+- **Arte:** personajes originales hechos con primitivas (cantantes chibi de coletas largas). Shader propio `ConcertDefense/Toon` (dos tonos + contorno) y `ConcertDefense/UnlitColor` para retícula, alcance y efectos. Los glitches usan rojo y negro.
+- **Audio:** pista de 120 BPM y diez efectos generados por código en `Assets/Audio` (autoría propia).
+- **Ajustes del proyecto:** tag `TeleportPad` añadido; orientación por defecto *Landscape Left*; `minSdkVersion` de Android bajado de 34 a 29.
 
+#### Scripts nuevos
+`Core/PointerInput`, `Core/TouchInputRouter`, `Core/Battlefield`, `Core/GameMessages`, `Core/Sfx`, `Core/PulseEffect`, `Enemies/NoiseZone`, `Rhythm/RollerCoasterCart`, `Rhythm/PointerDownRelay`, `AR/PlacementReticle`, `UI/WorldHealthBar`, `Editor/ConcertDefenseSmokeTest`.
 
+#### Requisitos del caso → dónde verlos
+| Requisito | Implementación |
+|---|---|
+| UI que sigue al objeto | `UIFollow` + `WorldHealthBar` (barras de vida) y `TowerMenu` (menú flotante) |
+| Eventos de toque | `TouchInputRouter` + `PointerInput` |
+| Movimiento del avatar | `AvatarController.SetDestination` |
+| Teletransportación | `TeleportPad` + destello `Vfx_CyanFlash` |
+| Roller Coaster | `UltimateController` + `RollerCoasterCart`, vía en `Battlefield/RollerCoaster` |
+| Detección de planos | `ARPlacementController` (`ARRaycastManager`, `PlaneWithinPolygon`) |
+| Crear / actualizar / eliminar | construir, mejorar y vender torres; enemigos y proyectiles |
+| Manipulación | `FieldManipulator` (pellizco, giro, arrastre) |
+| Retículas | `PlacementReticle` (verde/rojo) e indicador de `BuildSpot` |
+| Iluminación real | `LightEstimationController` en la Directional Light |
+| Colisiones y física | `Projectile`, `Enemy.ApplyKnockback`, `NoiseZone` |
 
+#### Verificación (Unity 6000.6.4f1 en modo batch)
+- Compilación sin errores ni avisos de C#.
+- `ConcertDefenseSmokeTest` entra en Play, comprueba el HUD inicial, coloca el campo, construye torres y juega las cuatro oleadas con un bot: termina en **Victoria con 0 errores en consola**. Resultado y capturas en `Capturas/`.
+- Comando: `Unity -batchmode -projectPath . -executeMethod ConcertDefense.EditorTools.ConcertDefenseSmokeTest.Run` con la variable de entorno `CONCERT_SMOKE=1`.
+- El bot acierta todos los tiempos, así que la dificultad real para una persona queda por ajustar jugando en el teléfono (valores en los prefabs y en `GameSetupUtility`).
+- **No verificado:** ejecución en un teléfono con ARCore (detección de planos reales, gestos con dos dedos, estimación de luz). En esta PC el editor 6000.6.4f1 no tiene instalado *Android Build Support*.
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+#### Pasos manuales pendientes (en el editor)
+0. **Unity Hub → Installs → 6000.6.4f1 → Add modules → Android Build Support** (con OpenJDK y Android SDK & NDK Tools).
+1. **File → Build Profiles → Android → Switch Platform.**
+2. **Project Settings → XR Plug-in Management → Android:** comprobar que *ARCore* está marcado.
+3. Conectar el teléfono con depuración USB y **Build And Run**. Hacer las capturas para el informe.

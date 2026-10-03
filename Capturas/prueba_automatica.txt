@@ -1,0 +1,14 @@
+[t=0.0] HUD al empezar a jugar -> VISIBLES: TopBar, StartWaveButton, RelocateButton, UltimateButton, BeatPulseRing, BeatButton, RhythmFeedbackText, ComboText, AR_GuidancePanel | OCULTOS: UltimateReadyGlow, BossBarContainer, ToastPanel, TowerSelector_Panel, GameOverPanel, VictoryPanel
+[t=0.0] Estado inicial: Scanning, sesión AR: Ready, modo sin AR: False
+[t=1.0] Tras pulsar Iniciar oleada: estado Playing, campo: colocado, reloj de ritmo: True
+[t=1.0] Teletransporte: (-0.83, 0.33, 0.77) -> (-1.52, 0.33, 0.77) (pad en (-1.52, 0.33, 0.77))
+[t=1.0] Torres construidas: 3, monedas restantes: 0
+[t=14.3] Oleada 1: inicio. Ánimo 20/20, monedas 0, torres 3
+[t=49.4] Oleada 2: inicio. Ánimo 20/20, monedas 84, torres 4
+[t=84.1] Oleada 3: inicio. Ánimo 20/20, monedas 84, torres 6
+[t=126.0] Oleada 4: inicio. Ánimo 20/20, monedas 38, torres 6
+[t=174.7] HUD al terminar -> VISIBLES: TopBar, StartWaveButton, RelocateButton, UltimateButton, BeatPulseRing, BeatButton, RhythmFeedbackText, ComboText, VictoryPanel | OCULTOS: UltimateReadyGlow, BossBarContainer, AR_GuidancePanel, ToastPanel, TowerSelector_Panel, GameOverPanel
+RESULTADO: Victory
+Oleada alcanzada: 4/4, Ánimo: 20/20, monedas: 354
+Torres: 6 (construidas 6, mejoras 11), Perfects: 345, Ultimates: 13, teletransportes para afinar: 3
+Errores registrados: 0

@@ -39,8 +39,8 @@ namespace ConcertDefense.Rhythm
         [SerializeField] private float knockbackForce = 1.8f;
 
         [Header("Carga")]
-        [Tooltip("Recarga pasiva por segundo durante una oleada (0.02 = lleno en 50 s).")]
-        [SerializeField] private float passiveChargeRate = 0.02f;
+        [Tooltip("Recarga pasiva por segundo durante una oleada (0.012 = lleno en unos 80 s).")]
+        [SerializeField] private float passiveChargeRate = 0.012f;
 
         private float currentCharge;
         private bool isCartActive;

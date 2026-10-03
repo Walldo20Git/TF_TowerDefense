@@ -34,6 +34,8 @@ namespace ConcertDefense.Enemies
 
         protected float abilityTimer;
 
+        protected override float DeathVfxSize => 2.5f;
+
         public BossType Type => bossType;
         public string BossTitle => bossTitle;
 

@@ -78,6 +78,9 @@ namespace ConcertDefense.Enemies
             }
         }
 
+        /// <summary>Tamaño relativo del efecto de muerte.</summary>
+        protected virtual float DeathVfxSize => 1f;
+
         public event Action<float, float> OnHealthChanged; // (actual, máxima)
         public event Action<Enemy> OnEnemyDeath;
         public event Action<Enemy> OnEnemyReachedEnd;
@@ -244,7 +247,7 @@ namespace ConcertDefense.Enemies
 
             if (GameManager.Instance != null) GameManager.Instance.AddCoins(coinsReward);
 
-            PulseEffect.Spawn(deathVfxPrefab, transform.position, Mathf.Max(1f, transform.localScale.x * 6f));
+            PulseEffect.Spawn(deathVfxPrefab, transform.position, DeathVfxSize);
             Sfx.Play(SfxId.Impact);
 
             OnEnemyDeath?.Invoke(this);
