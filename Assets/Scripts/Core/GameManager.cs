@@ -33,8 +33,8 @@ namespace ConcertDefense.Core
         [Tooltip("Número total de oleadas del juego.")]
         [SerializeField] private int totalWaves = 4;
 
-        // Variables de estado interno
         public GameState CurrentState { get; private set; } = GameState.Scanning;
+        public bool IsPlaying => CurrentState == GameState.Playing;
         public int CurrentHealth { get; private set; }
         public int MaxHealth => initialHealth;
         public int CurrentCoins { get; private set; }
@@ -49,7 +49,6 @@ namespace ConcertDefense.Core
 
         private void Awake()
         {
-            // Configurar Singleton
             if (Instance != null && Instance != this)
             {
                 Destroy(gameObject);
@@ -57,18 +56,13 @@ namespace ConcertDefense.Core
             }
             Instance = this;
 
-            // Inicializar valores base
             CurrentHealth = initialHealth;
             CurrentCoins = initialCoins;
         }
 
-        private void Start()
+        private void OnDestroy()
         {
-            // Notificar estado inicial al comenzar
-            OnHealthChanged?.Invoke(CurrentHealth, MaxHealth);
-            OnCoinsChanged?.Invoke(CurrentCoins);
-            OnWaveChanged?.Invoke(CurrentWave, totalWaves);
-            ChangeState(GameState.Scanning);
+            if (Instance == this) Instance = null;
         }
 
         /// <summary>
@@ -77,6 +71,9 @@ namespace ConcertDefense.Core
         public void ChangeState(GameState newState)
         {
             if (CurrentState == newState) return;
+
+            // Una partida terminada solo se abandona reiniciando la escena
+            if (CurrentState == GameState.GameOver || CurrentState == GameState.Victory) return;
 
             CurrentState = newState;
             OnGameStateChanged?.Invoke(CurrentState);
@@ -92,7 +89,7 @@ namespace ConcertDefense.Core
         }
 
         /// <summary>
-        /// Añade monedas al jugador (al eliminar enemigos, bonificaciones, etc.).
+        /// Añade monedas al jugador (al eliminar enemigos, vender torres, etc.).
         /// </summary>
         public void AddCoins(int amount)
         {
@@ -108,16 +105,11 @@ namespace ConcertDefense.Core
         public bool TrySpendCoins(int amount)
         {
             if (amount <= 0) return true;
+            if (CurrentCoins < amount) return false;
 
-            if (CurrentCoins >= amount)
-            {
-                CurrentCoins -= amount;
-                OnCoinsChanged?.Invoke(CurrentCoins);
-                return true;
-            }
-
-            Debug.LogWarning($"[GameManager] Monedas insuficientes: tienes {CurrentCoins}, requieres {amount}");
-            return false;
+            CurrentCoins -= amount;
+            OnCoinsChanged?.Invoke(CurrentCoins);
+            return true;
         }
 
         /// <summary>
@@ -129,6 +121,7 @@ namespace ConcertDefense.Core
 
             CurrentHealth = Mathf.Max(0, CurrentHealth - damage);
             OnHealthChanged?.Invoke(CurrentHealth, MaxHealth);
+            Sfx.Play(SfxId.StageHit);
 
             if (CurrentHealth <= 0)
             {
@@ -137,17 +130,12 @@ namespace ConcertDefense.Core
         }
 
         /// <summary>
-        /// Avanza el contador a la siguiente oleada.
+        /// Registra el número de oleada en curso.
         /// </summary>
         public void SetWave(int waveNumber)
         {
             CurrentWave = waveNumber;
             OnWaveChanged?.Invoke(CurrentWave, totalWaves);
-
-            if (CurrentWave > totalWaves)
-            {
-                ChangeState(GameState.Victory);
-            }
         }
 
         /// <summary>
@@ -155,6 +143,7 @@ namespace ConcertDefense.Core
         /// </summary>
         public void RestartGame()
         {
+            Time.timeScale = 1f;
             SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
         }
     }

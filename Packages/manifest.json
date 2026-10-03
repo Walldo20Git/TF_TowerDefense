@@ -1,6 +1,5 @@
 {
   "dependencies": {
-    "com.coplaydev.unity-mcp": "file:C:/Users/ADMIN/Downloads/unity-mcp-10.2.0/unity-mcp-10.2.0/MCPForUnity",
     "com.unity.ai.assistant": "2.20.0-pre.1",
     "com.unity.ai.inference": "2.6.1",
     "com.unity.feature.development": "1.0.2",

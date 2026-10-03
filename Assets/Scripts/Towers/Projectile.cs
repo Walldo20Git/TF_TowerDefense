@@ -1,189 +1,150 @@
 using UnityEngine;
+using ConcertDefense.Core;
 using ConcertDefense.Enemies;
 
 namespace ConcertDefense.Towers
 {
     /// <summary>
-    /// Gestiona la trayectoria, física de colisión, daño directo, daño en área y efectos de estado (ralentización y empuje)
-    /// generados por los proyectiles de las torres (ondas de sonido, notas musicales, puerros, etc.).
+    /// Proyectil de las torres (ondas, notas, puerros...). Tiene Rigidbody y collider trigger:
+    /// persigue a su objetivo y al chocar aplica daño directo o en área, ralentización y empuje físico.
     /// </summary>
     [RequireComponent(typeof(Collider))]
+    [RequireComponent(typeof(Rigidbody))]
     public class Projectile : MonoBehaviour
     {
-        [Header("Comportamiento de Vuelo")]
-        [Tooltip("Velocidad de avance del proyectil.")]
-        [SerializeField] private float speed = 6f;
+        [Header("Vuelo")]
+        [Tooltip("Velocidad en unidades de campo por segundo.")]
+        [SerializeField] private float speed = 2.4f;
 
-        [Tooltip("Si es true, persigue activamente al objetivo en movimiento.")]
-        [SerializeField] private bool isHoming = true;
-
-        [Tooltip("Velocidad de giro al perseguir al objetivo.")]
-        [SerializeField] private float turnRate = 12f;
-
-        [Tooltip("Tiempo de vida máximo en segundos antes de autodestruirse.")]
+        [Tooltip("Segundos de vida antes de autodestruirse.")]
         [SerializeField] private float maxLifetime = 4f;
 
         [Header("Efectos de Impacto")]
-        [Tooltip("Radio de daño en área (0 para daño a objetivo único).")]
+        [Tooltip("Radio de daño en área, en unidades de campo (0 = un solo objetivo).")]
         [SerializeField] private float splashRadius = 0f;
 
-        [Tooltip("Fuerza de empuje físico transmitida al enemigo impactado (para torre Drop).")]
+        [Tooltip("Velocidad de empuje transmitida a los enemigos (torre Drop).")]
         [SerializeField] private float knockbackForce = 0f;
 
-        [Tooltip("Factor de ralentización (1 = sin efecto, 0.5 = 50% de velocidad para torre Echo).")]
+        [Tooltip("Factor de ralentización (1 = sin efecto, 0.5 = mitad de velocidad; torre Echo).")]
         [SerializeField] private float slowFactor = 1f;
 
-        [Tooltip("Duración en segundos de la ralentización.")]
+        [Tooltip("Duración de la ralentización en segundos.")]
         [SerializeField] private float slowDuration = 0f;
 
-        [Tooltip("Prefab de partículas instanciado al colisionar.")]
+        [Tooltip("Efecto visual al impactar.")]
         [SerializeField] private GameObject impactVfxPrefab;
 
-        // Variables dinámicas asignadas al disparar
-        private Transform targetTransform;
-        private Vector3 targetLastKnownPosition;
-        private float damage = 25f;
+        /// <summary>Lo reducen las zonas de ruido del jefe Distorsión.</summary>
+        public float SpeedMultiplier { get; set; } = 1f;
+
+        private Enemy target;
+        private Vector3 lastTargetPosition;
+        private float damage;
         private Rigidbody rb;
-        private bool hasHit = false;
+        private bool hasHit;
+        private float lifetime;
 
         private void Awake()
         {
             rb = GetComponent<Rigidbody>();
-        }
-
-        private void Start()
-        {
-            Destroy(gameObject, maxLifetime);
+            rb.useGravity = false;
+            rb.isKinematic = false;
         }
 
         /// <summary>
-        /// Inicializa los parámetros de combate del proyectil al ser disparado por una torre.
+        /// Lanza el proyectil contra un enemigo con el daño ya calculado por la torre.
         /// </summary>
-        public void Initialize(Transform target, float projectileDamage, float bonusSpeed = 0f, float customSplash = -1f, float customKnockback = -1f, float customSlow = -1f, float customSlowDuration = -1f)
+        public void Launch(Enemy targetEnemy, float projectileDamage)
         {
-            targetTransform = target;
+            target = targetEnemy;
             damage = projectileDamage;
-
-            if (targetTransform != null)
-            {
-                targetLastKnownPosition = targetTransform.position;
-            }
-
-            if (bonusSpeed > 0f) speed += bonusSpeed;
-            if (customSplash >= 0f) splashRadius = customSplash;
-            if (customKnockback >= 0f) knockbackForce = customKnockback;
-            if (customSlow >= 0f) slowFactor = customSlow;
-            if (customSlowDuration >= 0f) slowDuration = customSlowDuration;
+            if (target != null) lastTargetPosition = target.transform.position;
         }
 
         private void Update()
         {
             if (hasHit) return;
 
-            // Actualizar última posición conocida del objetivo si aún existe
-            if (targetTransform != null)
+            lifetime += Time.deltaTime;
+            if (lifetime >= maxLifetime)
             {
-                targetLastKnownPosition = targetTransform.position;
+                Destroy(gameObject);
+                return;
             }
 
-            Vector3 direction = (targetLastKnownPosition - transform.position).normalized;
+            bool targetAlive = target != null && !target.IsDead;
+            if (targetAlive) lastTargetPosition = target.transform.position;
 
-            if (isHoming && direction != Vector3.zero)
-            {
-                Quaternion targetRotation = Quaternion.LookRotation(direction);
-                transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * turnRate);
-            }
+            float scale = Battlefield.Scale;
+            Vector3 toTarget = lastTargetPosition - transform.position;
+            float stepDistance = speed * SpeedMultiplier * scale * Time.deltaTime;
 
-            // Desplazamiento
-            if (rb != null && !rb.isKinematic)
+            // Respaldo de la colisión física: si ya está encima del objetivo, impacta
+            if (toTarget.magnitude <= Mathf.Max(stepDistance, 0.04f * scale))
             {
-                rb.linearVelocity = transform.forward * speed;
-            }
-            else
-            {
-                transform.position += transform.forward * (speed * Time.deltaTime);
+                Impact(targetAlive ? target : null);
+                return;
             }
 
-            // Si el proyectil llegó a la última posición conocida y no había objetivo vivo, impacta
-            if (Vector3.Distance(transform.position, targetLastKnownPosition) < 0.1f)
-            {
-                OnImpact(null);
-            }
+            Vector3 direction = toTarget.normalized;
+            transform.rotation = Quaternion.LookRotation(direction);
+            rb.linearVelocity = direction * (speed * SpeedMultiplier * scale);
         }
 
         private void OnTriggerEnter(Collider other)
         {
             if (hasHit) return;
 
-            if (other.CompareTag("Enemy"))
-            {
-                Enemy enemy = other.GetComponent<Enemy>();
-                OnImpact(enemy);
-            }
+            Enemy enemy = other.GetComponentInParent<Enemy>();
+            if (enemy != null && !enemy.IsDead) Impact(enemy);
         }
 
-        /// <summary>
-        /// Aplica daño directo o en área, empuje, ralentización y destruye el proyectil.
-        /// </summary>
-        private void OnImpact(Enemy directHitEnemy)
+        private void Impact(Enemy directHit)
         {
             if (hasHit) return;
             hasHit = true;
 
-            if (splashRadius > 0.05f)
+            if (splashRadius > 0.01f)
             {
-                // Daño en área (AoE)
-                Collider[] colliders = Physics.OverlapSphere(transform.position, splashRadius);
-                foreach (Collider col in colliders)
+                float worldRadius = splashRadius * Battlefield.Scale;
+
+                // Recorrido inverso: un jefe puede crear esbirros al recibir daño
+                for (int i = Enemy.All.Count - 1; i >= 0; i--)
                 {
-                    if (col.CompareTag("Enemy"))
+                    if (i >= Enemy.All.Count) continue;
+                    Enemy enemy = Enemy.All[i];
+                    if (Vector3.Distance(enemy.transform.position, transform.position) <= worldRadius)
                     {
-                        Enemy enemy = col.GetComponent<Enemy>();
-                        if (enemy != null)
-                        {
-                            ApplyEffectsToEnemy(enemy);
-                        }
+                        ApplyEffects(enemy);
                     }
                 }
             }
-            else if (directHitEnemy != null)
+            else if (directHit != null)
             {
-                // Daño a objetivo único
-                ApplyEffectsToEnemy(directHitEnemy);
+                ApplyEffects(directHit);
             }
 
-            // Instanciar efecto visual
-            if (impactVfxPrefab != null)
-            {
-                Instantiate(impactVfxPrefab, transform.position, Quaternion.identity);
-            }
-
+            PulseEffect.Spawn(impactVfxPrefab, transform.position, splashRadius > 0.01f ? splashRadius * 8f : 1f);
+            Sfx.Play(SfxId.Impact);
             Destroy(gameObject);
         }
 
-        /// <summary>
-        /// Aplica daño y estados a un enemigo individual.
-        /// </summary>
-        private void ApplyEffectsToEnemy(Enemy enemy)
+        private void ApplyEffects(Enemy enemy)
         {
             if (enemy == null || enemy.IsDead) return;
 
-            // 1. Daño
-            enemy.TakeDamage(damage);
+            if (slowFactor < 1f && slowDuration > 0f) enemy.ApplySlow(slowFactor, slowDuration);
 
-            // 2. Ralentización
-            if (slowFactor < 1f && slowDuration > 0f)
-            {
-                enemy.ApplySlow(slowFactor, slowDuration);
-            }
-
-            // 3. Empuje físico hacia atrás
             if (knockbackForce > 0f)
             {
-                Vector3 pushDirection = (enemy.transform.position - transform.position).normalized;
-                pushDirection.y = 0.1f; // Ligero impulso ascendente para evitar fricción en suelo
-                enemy.ApplyKnockback(pushDirection * knockbackForce);
+                Vector3 push = enemy.transform.position - transform.position;
+                push.y = 0f;
+                if (push.sqrMagnitude < 0.000001f) push = transform.forward;
+                enemy.ApplyKnockback(push.normalized * knockbackForce);
             }
+
+            enemy.TakeDamage(damage);
         }
 
         private void OnDrawGizmosSelected()
@@ -191,7 +152,7 @@ namespace ConcertDefense.Towers
             if (splashRadius > 0f)
             {
                 Gizmos.color = Color.magenta;
-                Gizmos.DrawWireSphere(transform.position, splashRadius);
+                Gizmos.DrawWireSphere(transform.position, splashRadius * transform.lossyScale.x);
             }
         }
     }

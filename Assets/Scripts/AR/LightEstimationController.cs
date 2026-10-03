@@ -5,50 +5,47 @@ using UnityEngine.XR.ARFoundation;
 namespace ConcertDefense.AR
 {
     /// <summary>
-    /// Sincroniza la iluminación virtual (Directional Light) con la estimación de luz del entorno real proporcionada por ARCore.
-    /// También detecta condiciones de baja luminosidad para posible modo nocturno/neón de las torres.
+    /// Iluminación según el entorno real (GDD 4.8): pide a ARCore la estimación de luz y la aplica
+    /// a la Directional Light en cada frameReceived. También avisa cuando el ambiente es oscuro (modo noche).
     /// </summary>
     public class LightEstimationController : MonoBehaviour
     {
         [Header("Referencias AR")]
-        [Tooltip("Gestor de la cámara AR donde se reciben los fotogramas y la estimación de luz.")]
+        [Tooltip("ARCameraManager de la Main Camera.")]
         [SerializeField] private ARCameraManager cameraManager;
 
-        [Tooltip("Luz direccional principal de la escena a sincronizar.")]
+        [Tooltip("Luz direccional a sincronizar (por defecto, la de este objeto).")]
         [SerializeField] private Light directionalLight;
 
-        [Header("Ajustes de Suavizado")]
-        [Tooltip("Velocidad de transición suave para evitar parpadeos bruscos ante cambios de luz del sensor.")]
+        [Header("Ajustes")]
+        [Tooltip("Velocidad de suavizado para evitar parpadeos del sensor.")]
         [SerializeField] private float smoothSpeed = 6f;
 
-        [Header("Modo Baja Luz (Opcional)")]
-        [Tooltip("Umbral de brillo (0 a 1) por debajo del cual se considera entorno oscuro.")]
+        [Tooltip("Rango de intensidad permitido para la luz.")]
+        [SerializeField] private Vector2 intensityRange = new Vector2(0.35f, 1.8f);
+
+        [Header("Modo Baja Luz (opcional)")]
+        [Tooltip("Brillo (0–1) por debajo del cual el entorno se considera oscuro.")]
         [SerializeField] private float lowLightThreshold = 0.25f;
 
-        // Valores objetivo calculados a partir de los sensores AR
         private float targetIntensity = 1f;
         private Color targetColor = Color.white;
         private Quaternion targetRotation;
-        private bool hasRotation = false;
+        private bool hasRotation;
+        private bool hasEstimate;
+        private bool subscribed;
 
-        // Estado público de luminosidad
         public float CurrentBrightness { get; private set; } = 1f;
-        public bool IsLowLight { get; private set; } = false;
 
-        // Evento notificado cuando se entra o sale del umbral de baja luz
+        /// <summary>True si el entorno real está oscuro.</summary>
+        public static bool IsLowLight { get; private set; }
+
         public static event Action<bool> OnLowLightStateChanged;
 
         private void Awake()
         {
-            if (directionalLight == null)
-            {
-                directionalLight = GetComponent<Light>();
-            }
-
-            if (cameraManager == null)
-            {
-                cameraManager = FindFirstObjectByType<ARCameraManager>();
-            }
+            if (directionalLight == null) directionalLight = GetComponent<Light>();
+            IsLowLight = false;
 
             if (directionalLight != null)
             {
@@ -60,78 +57,89 @@ namespace ConcertDefense.AR
 
         private void OnEnable()
         {
-            if (cameraManager != null)
-            {
-                cameraManager.frameReceived += OnCameraFrameReceived;
-            }
+            if (cameraManager == null) cameraManager = FindAnyObjectByType<ARCameraManager>();
+            if (cameraManager == null) return;
+
+            // Se piden todos los datos; cada dispositivo entrega los que soporta
+            cameraManager.requestedLightEstimation =
+                LightEstimation.AmbientIntensity |
+                LightEstimation.AmbientColor |
+                LightEstimation.MainLightDirection |
+                LightEstimation.MainLightIntensity;
+
+            cameraManager.frameReceived += OnCameraFrameReceived;
+            subscribed = true;
         }
 
         private void OnDisable()
         {
-            if (cameraManager != null)
-            {
-                cameraManager.frameReceived -= OnCameraFrameReceived;
-            }
+            if (subscribed && cameraManager != null) cameraManager.frameReceived -= OnCameraFrameReceived;
+            subscribed = false;
         }
 
         private void Update()
         {
-            if (directionalLight == null) return;
+            if (directionalLight == null || !hasEstimate) return;
 
-            // Interpolación suave de intensidad y color
-            directionalLight.intensity = Mathf.Lerp(directionalLight.intensity, targetIntensity, Time.deltaTime * smoothSpeed);
-            directionalLight.color = Color.Lerp(directionalLight.color, targetColor, Time.deltaTime * smoothSpeed);
+            float t = Time.deltaTime * smoothSpeed;
+            directionalLight.intensity = Mathf.Lerp(directionalLight.intensity, targetIntensity, t);
+            directionalLight.color = Color.Lerp(directionalLight.color, targetColor, t);
 
-            // Interpolación de dirección si el dispositivo soporta estimación de dirección solar/principal
             if (hasRotation)
             {
-                directionalLight.transform.rotation = Quaternion.Slerp(directionalLight.transform.rotation, targetRotation, Time.deltaTime * smoothSpeed);
+                directionalLight.transform.rotation = Quaternion.Slerp(directionalLight.transform.rotation, targetRotation, t);
             }
         }
 
         /// <summary>
-        /// Callback ejecutado cada vez que AR Foundation recibe un nuevo fotograma con datos de luz de ARCore.
+        /// Se ejecuta con cada fotograma de la cámara AR.
         /// </summary>
         private void OnCameraFrameReceived(ARCameraFrameEventArgs args)
         {
-            var lightEstimation = args.lightEstimation;
+            ARLightEstimationData estimation = args.lightEstimation;
+            float? brightness = null;
 
-            // 1. Brillo medio / Intensidad lumínica
-            if (lightEstimation.averageBrightness.HasValue)
+            // 1. Brillo: ambiente medio o, en modo HDR, el de la luz principal
+            if (estimation.averageBrightness.HasValue) brightness = estimation.averageBrightness.Value;
+            else if (estimation.averageMainLightBrightness.HasValue) brightness = estimation.averageMainLightBrightness.Value;
+
+            if (brightness.HasValue)
             {
-                CurrentBrightness = lightEstimation.averageBrightness.Value;
-                targetIntensity = CurrentBrightness;
-            }
-            else if (lightEstimation.mainLightIntensityLumens.HasValue)
-            {
-                // Conversión aproximada de lúmenes a escala de intensidad Unity estándar
-                CurrentBrightness = Mathf.Clamp01(lightEstimation.mainLightIntensityLumens.Value / 1000f);
-                targetIntensity = CurrentBrightness;
+                hasEstimate = true;
+                CurrentBrightness = Mathf.Clamp01(brightness.Value);
+                // Un brillo medio de 0.5 equivale a intensidad 1
+                targetIntensity = Mathf.Clamp(CurrentBrightness * 2f, intensityRange.x, intensityRange.y);
             }
 
-            // 2. Corrección de color y balance de blancos
-            if (lightEstimation.colorCorrection.HasValue)
+            // 2. Color
+            if (estimation.colorCorrection.HasValue)
             {
-                targetColor = lightEstimation.colorCorrection.Value;
+                hasEstimate = true;
+                targetColor = estimation.colorCorrection.Value;
             }
-            else if (lightEstimation.mainLightColor.HasValue)
+            else if (estimation.mainLightColor.HasValue)
             {
-                targetColor = lightEstimation.mainLightColor.Value;
+                hasEstimate = true;
+                targetColor = estimation.mainLightColor.Value;
             }
 
             // 3. Dirección de la luz principal
-            if (lightEstimation.mainLightDirection.HasValue)
+            if (estimation.mainLightDirection.HasValue)
             {
-                targetRotation = Quaternion.LookRotation(lightEstimation.mainLightDirection.Value);
+                hasEstimate = true;
                 hasRotation = true;
+                targetRotation = Quaternion.LookRotation(estimation.mainLightDirection.Value);
             }
 
-            // 4. Verificación de umbral de baja luz
-            bool isDark = CurrentBrightness < lowLightThreshold;
-            if (isDark != IsLowLight)
+            // 4. Modo noche
+            if (brightness.HasValue)
             {
-                IsLowLight = isDark;
-                OnLowLightStateChanged?.Invoke(IsLowLight);
+                bool isDark = CurrentBrightness < lowLightThreshold;
+                if (isDark != IsLowLight)
+                {
+                    IsLowLight = isDark;
+                    OnLowLightStateChanged?.Invoke(IsLowLight);
+                }
             }
         }
     }

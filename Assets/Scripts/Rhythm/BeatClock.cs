@@ -12,46 +12,54 @@ namespace ConcertDefense.Rhythm
     }
 
     /// <summary>
-    /// Reloj musical maestro sincronizado mediante AudioSettings.dspTime (GDD 4.4):
-    /// - Mantiene el compás exacto (120 BPM por defecto) sin desincronización por fotogramas.
-    /// - Emite eventos en cada pulso de compás (OnBeat) para sincronizar disparos y animaciones.
-    /// - Evalúa la precisión rítmica del botón Beat (Perfect, Good o Miss).
+    /// Reloj musical maestro (GDD 4.4):
+    /// - Lleva un compás fijo (120 BPM) sincronizado con la pista mediante AudioSettings.dspTime.
+    /// - Emite un evento en cada tiempo y en cada medio tiempo; las torres disparan con ellos.
+    /// - Evalúa la precisión del botón Beat (Perfect, Good o Miss).
     /// </summary>
     public class BeatClock : MonoBehaviour
     {
         public static BeatClock Instance { get; private set; }
 
+        /// <summary>Para pruebas automáticas: usar el tiempo de juego en lugar del reloj de audio.</summary>
+        public static bool ForceGameTime;
+
         [Header("Configuración de Ritmo (GDD 4.4)")]
-        [Tooltip("Pulsos por minuto de la pista musical (ej: 120 BPM).")]
+        [Tooltip("Pulsos por minuto de la pista musical.")]
         [SerializeField] private float bpm = 120f;
 
-        [Tooltip("Ventana de tolerancia para acierto PERFECT en segundos (±0.08 s).")]
+        [Tooltip("Ventana de acierto PERFECT en segundos (±).")]
         [SerializeField] private float perfectWindow = 0.08f;
 
-        [Tooltip("Ventana de tolerancia para acierto GOOD en segundos (±0.15 s).")]
+        [Tooltip("Ventana de acierto GOOD en segundos (±).")]
         [SerializeField] private float goodWindow = 0.15f;
 
         [Header("Pista Musical")]
-        [Tooltip("Fuente de audio con la pista de combate.")]
+        [Tooltip("Fuente de audio con la pista de combate (BPM fijo).")]
         [SerializeField] private AudioSource musicSource;
 
-        [Tooltip("Si es true, la música arranca automáticamente cuando GameManager pasa a estado Playing.")]
+        [Tooltip("Arranca solo cuando el campo queda colocado (estado Playing).")]
         [SerializeField] private bool autoStartOnPlaying = true;
 
-        // Variables de sincronización DSP
-        private double dspStartTime;
-        private double secondsPerBeat;
-        private int lastBeatCount = -1;
-        private bool isRunning = false;
+        private double startTime;
+        private double secondsPerBeat = 0.5;
+        private double dspAtAwake;
+        private int lastHalfBeat = -1;
+        private bool isRunning;
+        private bool useAudioClock;
 
         public float BPM => bpm;
         public float SecondsPerBeat => (float)secondsPerBeat;
-        public bool IsRunning => isRunning;
-        public int CurrentBeatCount { get; private set; } = 0;
+        public int CurrentBeat { get; private set; }
 
-        // Eventos
-        public event Action<int> OnBeat;              // Emitido en cada pulso (1, 2, 3, 4...)
-        public event Action<float> OnBeatPulse;       // Progreso normalizado de 0 a 1 para animaciones de UI
+        public static bool IsRunning => Instance != null && Instance.isRunning;
+
+        /// <summary>Cada tiempo del compás (0, 1, 2...).</summary>
+        public static event Action<int> OnBeat;
+        /// <summary>Cada medio tiempo; los pares coinciden con OnBeat.</summary>
+        public static event Action<int> OnHalfBeat;
+        /// <summary>Progreso 0–1 dentro del tiempo actual, para animar la UI.</summary>
+        public static event Action<float> OnBeatPulse;
 
         private void Awake()
         {
@@ -62,146 +70,114 @@ namespace ConcertDefense.Rhythm
             }
             Instance = this;
 
-            CalculateBeatTiming();
-        }
-
-        private void OnEnable()
-        {
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.OnGameStateChanged += HandleGameStateChanged;
-            }
-        }
-
-        private void OnDisable()
-        {
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.OnGameStateChanged -= HandleGameStateChanged;
-            }
+            if (musicSource == null) musicSource = GetComponent<AudioSource>();
+            dspAtAwake = AudioSettings.dspTime;
+            secondsPerBeat = 60.0 / Mathf.Max(30f, bpm);
         }
 
         private void Start()
         {
-            if (musicSource == null)
-            {
-                musicSource = GetComponent<AudioSource>();
-            }
+            if (GameManager.Instance == null) return;
 
-            if (GameManager.Instance != null && GameManager.Instance.CurrentState == GameState.Playing && autoStartOnPlaying)
-            {
-                StartClock();
-            }
+            GameManager.Instance.OnGameStateChanged += HandleGameStateChanged;
+            if (GameManager.Instance.IsPlaying && autoStartOnPlaying) StartClock();
         }
 
-        private void HandleGameStateChanged(GameState newState)
+        private void OnDestroy()
         {
-            if (newState == GameState.Playing && autoStartOnPlaying)
+            if (GameManager.Instance != null) GameManager.Instance.OnGameStateChanged -= HandleGameStateChanged;
+            if (Instance == this) Instance = null;
+        }
+
+        private void HandleGameStateChanged(GameState state)
+        {
+            if (state == GameState.Playing && autoStartOnPlaying)
             {
-                StartClock();
+                if (!isRunning) StartClock();
             }
-            else if (newState == GameState.GameOver || newState == GameState.Victory)
+            else if (state == GameState.GameOver || state == GameState.Victory)
             {
                 StopClock();
             }
         }
 
-        /// <summary>
-        /// Calcula la duración exacta de cada pulso de compás.
-        /// </summary>
-        public void CalculateBeatTiming()
-        {
-            bpm = Mathf.Max(30f, bpm);
-            secondsPerBeat = 60.0 / bpm;
-        }
+        private double Now => useAudioClock ? AudioSettings.dspTime : Time.timeAsDouble;
 
         /// <summary>
-        /// Inicia la reproducción musical y la medición temporal en DSP time.
+        /// Arranca la música y el compás.
         /// </summary>
         public void StartClock()
         {
-            CalculateBeatTiming();
-            dspStartTime = AudioSettings.dspTime + 0.1; // Pequeño buffer para sincronización perfecta de hardware
+            secondsPerBeat = 60.0 / Mathf.Max(30f, bpm);
+
+            // Si el dispositivo de audio no avanza (sin salida de sonido), se usa el tiempo de juego
+            useAudioClock = !ForceGameTime && AudioSettings.dspTime > dspAtAwake;
+            startTime = Now + 0.1;
 
             if (musicSource != null && musicSource.clip != null)
             {
-                musicSource.PlayScheduled(dspStartTime);
+                musicSource.loop = true;
+                if (useAudioClock) musicSource.PlayScheduled(startTime);
+                else musicSource.PlayDelayed(0.1f);
             }
 
-            lastBeatCount = -1;
+            lastHalfBeat = -1;
             isRunning = true;
-            Debug.Log($"[BeatClock] Reloj rítmico iniciado a {bpm} BPM (1 pulso cada {secondsPerBeat:F3}s).");
         }
 
         /// <summary>
-        /// Detiene la música y el reloj.
+        /// Detiene la música y el compás.
         /// </summary>
         public void StopClock()
         {
             isRunning = false;
-            if (musicSource != null && musicSource.isPlaying)
-            {
-                musicSource.Stop();
-            }
+            if (musicSource != null) musicSource.Stop();
         }
 
         private void Update()
         {
             if (!isRunning) return;
 
-            double songTime = AudioSettings.dspTime - dspStartTime;
-            if (songTime < 0) return; // Esperando el dspStartTime programado
+            double songTime = Now - startTime;
+            if (songTime < 0) return;
 
-            // Número de pulsos transcurridos
-            double currentBeatFloat = songTime / secondsPerBeat;
-            int currentBeat = (int)currentBeatFloat;
+            double halfBeatFloat = songTime / (secondsPerBeat * 0.5);
+            int halfBeat = (int)halfBeatFloat;
 
-            // Detectar transición de un nuevo compás
-            if (currentBeat > lastBeatCount)
+            if (halfBeat > lastHalfBeat)
             {
-                lastBeatCount = currentBeat;
-                CurrentBeatCount = currentBeat;
-                OnBeat?.Invoke(CurrentBeatCount);
+                lastHalfBeat = halfBeat;
+                OnHalfBeat?.Invoke(halfBeat);
+
+                if (halfBeat % 2 == 0)
+                {
+                    CurrentBeat = halfBeat / 2;
+                    OnBeat?.Invoke(CurrentBeat);
+                }
             }
 
-            // Progreso del pulso actual (0.0 a 1.0) para animar el botón de la UI
-            float pulseProgress = (float)(currentBeatFloat - currentBeat);
-            OnBeatPulse?.Invoke(pulseProgress);
+            double beatFloat = songTime / secondsPerBeat;
+            OnBeatPulse?.Invoke((float)(beatFloat - Math.Floor(beatFloat)));
         }
 
         /// <summary>
-        /// Evalúa la precisión del toque del jugador en relación al pulso de compás más cercano.
+        /// Evalúa un toque respecto al tiempo del compás más cercano.
         /// </summary>
-        public HitAccuracy EvaluateTap(out float timingOffset)
+        public HitAccuracy EvaluateTap(out float timingOffset, out int nearestBeat)
         {
-            if (!isRunning)
-            {
-                timingOffset = 0f;
-                return HitAccuracy.Miss;
-            }
+            timingOffset = 0f;
+            nearestBeat = -1;
+            if (!isRunning) return HitAccuracy.Miss;
 
-            double songTime = AudioSettings.dspTime - dspStartTime;
-            double currentBeatFloat = songTime / secondsPerBeat;
-            double nearestBeat = Math.Round(currentBeatFloat);
-
-            // Diferencia en segundos entre el toque y el pulso más próximo
-            double offsetInSeconds = (currentBeatFloat - nearestBeat) * secondsPerBeat;
-            timingOffset = (float)offsetInSeconds;
+            double beatFloat = (Now - startTime) / secondsPerBeat;
+            double nearest = Math.Round(beatFloat);
+            nearestBeat = (int)nearest;
+            timingOffset = (float)((beatFloat - nearest) * secondsPerBeat);
 
             float absOffset = Mathf.Abs(timingOffset);
-
-            if (absOffset <= perfectWindow)
-            {
-                return HitAccuracy.Perfect;
-            }
-            else if (absOffset <= goodWindow)
-            {
-                return HitAccuracy.Good;
-            }
-            else
-            {
-                return HitAccuracy.Miss;
-            }
+            if (absOffset <= perfectWindow) return HitAccuracy.Perfect;
+            if (absOffset <= goodWindow) return HitAccuracy.Good;
+            return HitAccuracy.Miss;
         }
     }
 }

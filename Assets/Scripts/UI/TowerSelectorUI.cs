@@ -2,208 +2,130 @@ using System;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
-using ConcertDefense.Towers;
 using ConcertDefense.Core;
+using ConcertDefense.Towers;
 
 namespace ConcertDefense.UI
 {
     [Serializable]
     public class TowerCardData
     {
-        [Tooltip("Tipo de torre correspondiente a esta tarjeta.")]
+        [Tooltip("Tipo de torre de esta tarjeta.")]
         public TowerType type;
 
-        [Tooltip("Nombre de la cantante/personaje anime de la torre.")]
+        [Tooltip("Nombre de la cantante.")]
         public string characterName;
 
-        [Tooltip("Costo en monedas para construir esta torre.")]
+        [Tooltip("Costo en monedas.")]
         public int cost;
 
-        [Tooltip("Prefab que se instanciará sobre el BuildSpot.")]
+        [Tooltip("Prefab que se construye sobre el BuildSpot.")]
         public GameObject towerPrefab;
 
-        [Tooltip("Botón táctil de la tarjeta.")]
+        [Tooltip("Botón de la tarjeta.")]
         public Button cardButton;
 
-        [Tooltip("Texto para desplegar el costo en monedas.")]
+        [Tooltip("Texto del costo.")]
         public TextMeshProUGUI costText;
     }
 
     /// <summary>
-    /// Menú de selección y compra de torres (GDD 4.3 y 7):
-    /// - Aparece en pantalla cuando el jugador pulsa sobre una plataforma libre (BuildSpot).
-    /// - Muestra las tarjetas con retrato anime y costo de cada torre (Bass: 50, Treble: 40, Echo: 60, Drop: 80).
-    /// - Habilita o deshabilita los botones según el saldo de monedas disponible.
-    /// - Al seleccionar una tarjeta, construye la torre sobre la plataforma activa y cierra el menú.
+    /// Selector de torres (GDD 4.3 y 7): aparece al tocar una plataforma libre y muestra una tarjeta
+    /// por cantante con su retrato y costo. Las tarjetas se bloquean si no alcanzan las monedas.
     /// </summary>
     public class TowerSelectorUI : MonoBehaviour
     {
         public static TowerSelectorUI Instance { get; private set; }
 
-        [Header("Contenedor Principal")]
-        [Tooltip("Panel raíz que contiene las tarjetas de compra de torres.")]
+        [Header("Contenedor")]
         [SerializeField] private GameObject panelRoot;
-
-        [Tooltip("Botón para cancelar y cerrar el selector sin construir.")]
         [SerializeField] private Button closeButton;
 
-        [Header("Tarjetas de Personaje / Torre (GDD 4.3)")]
-        [SerializeField] private TowerCardData[] towerCards;
+        [Header("Tarjetas (GDD 4.3)")]
+        [SerializeField] private TowerCardData[] towerCards = new TowerCardData[0];
 
-        // Referencia a la plataforma seleccionada actualmente
         private BuildSpot targetBuildSpot;
+
+        public bool IsOpen => panelRoot != null && panelRoot.activeSelf;
 
         private void Awake()
         {
-            if (Instance != null && Instance != this)
-            {
-                Destroy(gameObject);
-                return;
-            }
             Instance = this;
-        }
-
-        private void OnEnable()
-        {
-            BuildSpot.OnBuildSpotClicked += OpenSelector;
-
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.OnCoinsChanged += HandleCoinsChanged;
-            }
-
-            if (closeButton != null)
-            {
-                closeButton.onClick.AddListener(CloseSelector);
-            }
-
-            // Configurar listeners de cada tarjeta
-            for (int i = 0; i < towerCards.Length; i++)
-            {
-                int index = i;
-                if (towerCards[index].cardButton != null)
-                {
-                    towerCards[index].cardButton.onClick.AddListener(() => OnCardSelected(index));
-                }
-            }
-        }
-
-        private void OnDisable()
-        {
-            BuildSpot.OnBuildSpotClicked -= OpenSelector;
-
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.OnCoinsChanged -= HandleCoinsChanged;
-            }
-
-            if (closeButton != null)
-            {
-                closeButton.onClick.RemoveListener(CloseSelector);
-            }
-
-            for (int i = 0; i < towerCards.Length; i++)
-            {
-                if (towerCards[i].cardButton != null)
-                {
-                    towerCards[i].cardButton.onClick.RemoveAllListeners();
-                }
-            }
         }
 
         private void Start()
         {
-            InitializeCardTexts();
+            BuildSpot.OnBuildSpotClicked += OpenSelector;
+            if (GameManager.Instance != null) GameManager.Instance.OnCoinsChanged += HandleCoinsChanged;
+            if (closeButton != null) closeButton.onClick.AddListener(CloseSelector);
+
+            for (int i = 0; i < towerCards.Length; i++)
+            {
+                int index = i;
+                TowerCardData card = towerCards[i];
+                if (card.cardButton != null) card.cardButton.onClick.AddListener(() => OnCardSelected(index));
+                if (card.costText != null) card.costText.text = card.cost.ToString();
+            }
+
             CloseSelector();
         }
 
-        /// <summary>
-        /// Asigna los textos de costo iniciales a cada tarjeta.
-        /// </summary>
-        private void InitializeCardTexts()
+        private void OnDestroy()
         {
-            foreach (var card in towerCards)
-            {
-                if (card.costText != null)
-                {
-                    card.costText.text = $"{card.cost} pts";
-                }
-            }
+            BuildSpot.OnBuildSpotClicked -= OpenSelector;
+            if (GameManager.Instance != null) GameManager.Instance.OnCoinsChanged -= HandleCoinsChanged;
+            if (Instance == this) Instance = null;
         }
 
         /// <summary>
-        /// Despliega el menú de selección vinculado al BuildSpot presionado.
+        /// Abre el selector para la plataforma tocada.
         /// </summary>
         public void OpenSelector(BuildSpot spot)
         {
             if (spot == null || spot.IsOccupied) return;
 
             targetBuildSpot = spot;
-
-            if (panelRoot != null)
-            {
-                panelRoot.SetActive(true);
-            }
-
+            if (TowerMenu.Instance != null) TowerMenu.Instance.CloseMenu();
+            if (panelRoot != null) panelRoot.SetActive(true);
             RefreshAffordability();
         }
 
         /// <summary>
-        /// Oculta el menú selector y desvincula la plataforma.
+        /// Cierra el selector sin construir.
         /// </summary>
         public void CloseSelector()
         {
             targetBuildSpot = null;
-
-            if (panelRoot != null)
-            {
-                panelRoot.SetActive(false);
-            }
+            if (panelRoot != null) panelRoot.SetActive(false);
         }
 
         /// <summary>
-        /// Comprueba si el jugador puede costear cada una de las 4 torres y actualiza la interactividad de los botones.
+        /// Bloquea las tarjetas que el jugador no puede pagar.
         /// </summary>
         public void RefreshAffordability()
         {
-            int currentCoins = GameManager.Instance != null ? GameManager.Instance.CurrentCoins : 0;
+            int coins = GameManager.Instance != null ? GameManager.Instance.CurrentCoins : 0;
 
-            foreach (var card in towerCards)
+            foreach (TowerCardData card in towerCards)
             {
-                if (card.cardButton != null)
-                {
-                    card.cardButton.interactable = currentCoins >= card.cost;
-                }
+                if (card.cardButton != null) card.cardButton.interactable = coins >= card.cost;
             }
         }
 
-        private void HandleCoinsChanged(int newCoins)
+        private void HandleCoinsChanged(int coins)
         {
-            if (panelRoot != null && panelRoot.activeSelf)
-            {
-                RefreshAffordability();
-            }
+            if (IsOpen) RefreshAffordability();
         }
 
-        /// <summary>
-        /// Llamado cuando el jugador toca una tarjeta para construir la torre elegida.
-        /// </summary>
         private void OnCardSelected(int cardIndex)
         {
-            if (targetBuildSpot == null)
+            if (targetBuildSpot == null || cardIndex < 0 || cardIndex >= towerCards.Length)
             {
                 CloseSelector();
                 return;
             }
 
-            if (cardIndex < 0 || cardIndex >= towerCards.Length) return;
-
-            TowerCardData chosenCard = towerCards[cardIndex];
-
-            // Intentar construir la torre en la plataforma
-            bool built = targetBuildSpot.BuildTower(chosenCard.towerPrefab);
-
-            if (built)
+            if (targetBuildSpot.BuildTower(towerCards[cardIndex].towerPrefab))
             {
                 CloseSelector();
             }

@@ -1,169 +1,55 @@
 using System;
 using UnityEngine;
-using UnityEngine.EventSystems;
 using ConcertDefense.Core;
 
 namespace ConcertDefense.Player
 {
     /// <summary>
-    /// Plataforma de teletransporte distribuida por el campo:
-    /// - Al tocar un pad, la heroína se traslada a su posición con un destello cian.
-    /// - Si la heroína ya está en este pad y existe un pairedPad asignado, se teletransporta hacia el pad emparejado.
-    /// - Posee tiempo de enfriamiento para prevenir rebotes accidentales.
+    /// Pad de teletransporte (GDD 4.2):
+    /// - Al tocarlo, la heroína desaparece con un destello cian y reaparece sobre este pad.
+    /// - Si ya está encima, salta al pad emparejado.
     /// </summary>
     [RequireComponent(typeof(Collider))]
     public class TeleportPad : MonoBehaviour
     {
-        [Header("Conexión y Destino")]
-        [Tooltip("Pad emparejado hacia el cual enviar al avatar si ya está parado en este pad.")]
+        [Header("Conexión")]
+        [Tooltip("Pad al que se envía a la heroína si ya está sobre este.")]
         [SerializeField] private TeleportPad pairedPad;
 
-        [Tooltip("Punto de aterrizaje exacto del avatar (si es nulo, usa la posición del pad).")]
-        [SerializeField] private Transform arrivalPoint;
-
-        [Header("Efectos (GDD 4.2: Destello Cian)")]
-        [Tooltip("Prefab de partículas con destello de luz cian.")]
-        [SerializeField] private GameObject cyanFlashVfxPrefab;
-
-        [Tooltip("Sonido de teletransporte espacial/anime.")]
-        [SerializeField] private AudioClip teleportSfx;
-
         [Header("Ajustes")]
-        [Tooltip("Tiempo en segundos antes de que el pad pueda volver a activarse.")]
-        [SerializeField] private float cooldown = 1.0f;
+        [Tooltip("Segundos antes de poder volver a usar el pad.")]
+        [SerializeField] private float cooldown = 0.5f;
 
-        // Variables de estado
-        private float lastTeleportTime = -10f;
-        private AudioSource audioSource;
+        [Tooltip("Distancia (unidades de campo) a la que se considera que la heroína está sobre el pad.")]
+        [SerializeField] private float onPadDistance = 0.12f;
 
-        public Vector3 ArrivalPosition => arrivalPoint != null ? arrivalPoint.position : transform.position;
-        public bool IsOnCooldown => Time.time < lastTeleportTime + cooldown;
+        private float lastUseTime = -10f;
 
-        // Eventos
+        public bool IsOnCooldown => Time.time < lastUseTime + cooldown;
+
         public static event Action<TeleportPad> OnTeleportTriggered;
 
-        private void Awake()
+        /// <summary>
+        /// Toque del jugador sobre el pad (lo enruta TouchInputRouter).
+        /// </summary>
+        public void HandleTap()
         {
-            audioSource = GetComponent<AudioSource>();
-            if (audioSource == null && teleportSfx != null)
-            {
-                audioSource = gameObject.AddComponent<AudioSource>();
-                audioSource.playOnAwake = false;
-                audioSource.spatialBlend = 0.8f; // Audio 3D moderado
-            }
-
-            if (arrivalPoint == null)
-            {
-                arrivalPoint = transform;
-            }
-        }
-
-        private void OnMouseDown()
-        {
-            // Ignorar clic si el cursor está sobre un elemento de UI (ej: botón Iniciar Oleada)
-            if (EventSystem.current != null && EventSystem.current.IsPointerOverGameObject())
-            {
-                return;
-            }
-
-            // Solo actuar durante partida en curso
-            if (GameManager.Instance != null && GameManager.Instance.CurrentState != GameState.Playing)
-            {
-                return;
-            }
-
             if (IsOnCooldown) return;
 
-            ActivatePad();
-        }
-
-        /// <summary>
-        /// Activa la lógica de teletransporte según la ubicación actual del avatar.
-        /// </summary>
-        public void ActivatePad()
-        {
             AvatarController avatar = AvatarController.Instance;
-            if (avatar == null)
-            {
-                avatar = FindFirstObjectByType<AvatarController>();
-                if (avatar == null) return;
-            }
+            if (avatar == null) return;
 
-            float distanceToAvatar = Vector3.Distance(avatar.transform.position, ArrivalPosition);
+            Vector3 delta = avatar.transform.position - transform.position;
+            delta.y = 0f;
+            bool avatarOnPad = delta.magnitude <= onPadDistance * Battlefield.Scale;
 
-            // Si el avatar ya está en este pad y tenemos un pad emparejado, enviarlo al pad compañero
-            if (distanceToAvatar < 0.5f && pairedPad != null)
-            {
-                TeleportAvatarTo(pairedPad.ArrivalPosition);
-                pairedPad.RegisterTeleportArrival();
-            }
-            else
-            {
-                // Si el avatar está lejos, traerlo a este pad
-                TeleportAvatarTo(ArrivalPosition);
-            }
+            TeleportPad destination = avatarOnPad && pairedPad != null ? pairedPad : this;
 
-            RegisterTeleportArrival();
-        }
+            avatar.Teleport(destination.transform.position);
+            lastUseTime = Time.time;
+            destination.lastUseTime = Time.time;
 
-        /// <summary>
-        /// Ejecuta el traslado instantáneo, reproduce efectos y emite eventos.
-        /// </summary>
-        private void TeleportAvatarTo(Vector3 destination)
-        {
-            AvatarController avatar = AvatarController.Instance;
-            if (avatar != null)
-            {
-                // Destello cian de salida
-                SpawnFlashVfx(avatar.transform.position);
-
-                // Teletransporte
-                avatar.Teleport(destination);
-
-                // Destello cian de llegada
-                SpawnFlashVfx(destination);
-
-                // Sonido
-                PlayTeleportSound();
-
-                OnTeleportTriggered?.Invoke(this);
-            }
-        }
-
-        /// <summary>
-        /// Instancia el efecto visual de partículas de destello cian.
-        /// </summary>
-        private void SpawnFlashVfx(Vector3 pos)
-        {
-            if (cyanFlashVfxPrefab != null)
-            {
-                Instantiate(cyanFlashVfxPrefab, pos, Quaternion.identity);
-            }
-        }
-
-        private void PlayTeleportSound()
-        {
-            if (audioSource != null && teleportSfx != null)
-            {
-                audioSource.PlayOneShot(teleportSfx);
-            }
-        }
-
-        /// <summary>
-        /// Registra el tiempo para el enfriamiento del pad.
-        /// </summary>
-        public void RegisterTeleportArrival()
-        {
-            lastTeleportTime = Time.time;
-        }
-
-        private void OnTriggerEnter(Collider other)
-        {
-            // Opcional: si el avatar camina físicamente hacia el pad y hay un pad compañero configurado
-            if (other.CompareTag("Avatar") && !IsOnCooldown && pairedPad != null)
-            {
-                ActivatePad();
-            }
+            OnTeleportTriggered?.Invoke(destination);
         }
     }
 }

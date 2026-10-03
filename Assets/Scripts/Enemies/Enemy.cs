@@ -1,231 +1,268 @@
 using System;
-using System.Collections;
+using System.Collections.Generic;
 using UnityEngine;
 using ConcertDefense.Core;
+using ConcertDefense.UI;
 
 namespace ConcertDefense.Enemies
 {
     /// <summary>
-    /// Controla el comportamiento base de los enemigos (Glitches):
-    /// - Movimiento a lo largo de waypoints en el escenario.
-    /// - Sistema de salud, daño recibido y efectos de estado (ralentización, empuje).
-    /// - Recompensa en monedas al morir y daño al Ánimo del escenario al llegar a la meta.
+    /// Comportamiento base de los enemigos (Glitches, GDD 5):
+    /// - Avanza por los waypoints del camino en unidades de campo.
+    /// - Vida, ralentización (torre Echo) y empuje con Rigidbody (torre Drop / Roller Coaster).
+    /// - Da monedas al morir y resta Ánimo al llegar al escenario.
     /// </summary>
     [RequireComponent(typeof(Collider))]
     public class Enemy : MonoBehaviour
     {
+        /// <summary>Enemigos vivos en el campo. Lo usan torres y proyectiles para buscar objetivo.</summary>
+        public static readonly List<Enemy> All = new List<Enemy>();
+
         [Header("Atributos Base")]
         [Tooltip("Nombre identificador del Glitch (ej: Pixel, Static, Amp).")]
         [SerializeField] protected string glitchName = "Pixel";
 
         [Tooltip("Vida máxima del enemigo.")]
-        [SerializeField] protected float maxHealth = 100f;
+        [SerializeField] protected float maxHealth = 40f;
 
-        [Tooltip("Velocidad de avance en metros por segundo.")]
-        [SerializeField] protected float moveSpeed = 1.2f;
+        [Tooltip("Velocidad de avance en unidades de campo por segundo.")]
+        [SerializeField] protected float moveSpeed = 0.22f;
 
         [Tooltip("Monedas otorgadas al jugador cuando este glitch es destruido.")]
-        [SerializeField] protected int coinsReward = 15;
+        [SerializeField] protected int coinsReward = 8;
 
-        [Tooltip("Daño causado al Ánimo del escenario si este enemigo alcanza la meta.")]
+        [Tooltip("Ánimo que resta al escenario si alcanza la meta (1 glitch, 5 jefe).")]
         [SerializeField] protected int stageDamage = 1;
 
-        [Header("Efectos")]
-        [Tooltip("Prefab de partículas instanciado al ser derrotado.")]
+        [Tooltip("Altura sobre el camino a la que flota, en unidades de campo.")]
+        [SerializeField] protected float hoverHeight = 0.06f;
+
+        [Tooltip("Resistencia al empuje (0 = sale volando, 1 = inmune).")]
+        [Range(0f, 1f)]
+        [SerializeField] protected float knockbackResistance = 0f;
+
+        [Header("Efectos y UI")]
+        [Tooltip("Efecto instanciado al ser derrotado.")]
         [SerializeField] protected GameObject deathVfxPrefab;
 
-        // Variables de estado
+        [Tooltip("Prefab de la barra de vida flotante (Canvas World Space).")]
+        [SerializeField] protected GameObject healthBarPrefab;
+
+        [Tooltip("Altura de la barra de vida sobre el enemigo, en unidades de campo.")]
+        [SerializeField] protected float healthBarHeight = 0.14f;
+
+        // Estado
         protected float currentHealth;
         protected Transform[] waypoints;
-        protected int currentWaypointIndex = 0;
-        protected float currentSpeedModifier = 1f;
-        protected Coroutine slowCoroutine;
+        protected int currentWaypointIndex;
         protected Rigidbody rb;
-        protected bool isDead = false;
+        protected bool isDead;
 
-        // Propiedades públicas
+        private float slowFactor = 1f;
+        private float slowTimer;
+        private float knockbackTimer;
+
         public string GlitchName => glitchName;
         public float CurrentHealth => currentHealth;
         public float MaxHealth => maxHealth;
         public bool IsDead => isDead;
 
-        // Eventos
+        /// <summary>Cuánto ha avanzado por el camino; mayor = más cerca del escenario.</summary>
+        public float PathProgress
+        {
+            get
+            {
+                if (waypoints == null || currentWaypointIndex >= waypoints.Length) return float.MaxValue;
+                float remaining = Vector3.Distance(transform.position, waypoints[currentWaypointIndex].position) / Battlefield.Scale;
+                return currentWaypointIndex * 10f - remaining;
+            }
+        }
+
         public event Action<float, float> OnHealthChanged; // (actual, máxima)
         public event Action<Enemy> OnEnemyDeath;
         public event Action<Enemy> OnEnemyReachedEnd;
+        /// <summary>Se emite una sola vez cuando el enemigo sale del campo, por muerte o por llegar a la meta.</summary>
+        public event Action<Enemy> OnRemoved;
 
         protected virtual void Awake()
         {
             rb = GetComponent<Rigidbody>();
+            currentHealth = maxHealth;
+        }
+
+        protected virtual void OnEnable()
+        {
+            All.Add(this);
+        }
+
+        protected virtual void OnDisable()
+        {
+            All.Remove(this);
         }
 
         protected virtual void Start()
         {
-            currentHealth = maxHealth;
+            if (healthBarPrefab != null)
+            {
+                GameObject bar = Instantiate(healthBarPrefab);
+                WorldHealthBar healthBar = bar.GetComponent<WorldHealthBar>();
+                if (healthBar != null) healthBar.Bind(this, healthBarHeight);
+            }
+
             OnHealthChanged?.Invoke(currentHealth, maxHealth);
         }
 
         /// <summary>
-        /// Inicializa la ruta de waypoints asignada por el WaveSpawner o al dividirse de un jefe.
+        /// Asigna la ruta. <paramref name="startIndex"/> es el waypoint hacia el que avanza
+        /// y <paramref name="customSpawnPos"/> permite nacer en medio del camino (esbirros de jefe).
         /// </summary>
-        public void InitializePath(Transform[] pathWaypoints, int startIndex = 0, Vector3? customSpawnPos = null)
+        public void InitializePath(Transform[] pathWaypoints, int startIndex, Vector3? customSpawnPos)
         {
             waypoints = pathWaypoints;
-            currentWaypointIndex = Mathf.Clamp(startIndex, 0, waypoints != null ? waypoints.Length : 0);
+            if (waypoints == null || waypoints.Length == 0) return;
 
-            if (customSpawnPos.HasValue)
-            {
-                transform.position = customSpawnPos.Value;
-            }
-            else if (waypoints != null && waypoints.Length > 0 && waypoints[0] != null)
-            {
-                transform.position = waypoints[0].position;
-            }
+            currentWaypointIndex = Mathf.Clamp(startIndex, 0, waypoints.Length - 1);
+            Vector3 spawn = customSpawnPos ?? waypoints[currentWaypointIndex].position;
+            spawn.y = waypoints[currentWaypointIndex].position.y + hoverHeight * Battlefield.Scale;
+            transform.position = spawn;
         }
 
         protected virtual void Update()
         {
             if (isDead) return;
 
+            if (slowTimer > 0f)
+            {
+                slowTimer -= Time.deltaTime;
+                if (slowTimer <= 0f) slowFactor = 1f;
+            }
+
+            // Mientras dura el empuje manda la física; después retoma el camino
+            if (knockbackTimer > 0f)
+            {
+                knockbackTimer -= Time.deltaTime;
+                if (knockbackTimer <= 0f) EndKnockback();
+                return;
+            }
+
             MoveAlongPath();
         }
 
-        /// <summary>
-        /// Mueve y orienta al enemigo hacia el waypoint objetivo actual.
-        /// </summary>
-        protected virtual void MoveAlongPath()
+        private void MoveAlongPath()
         {
-            if (waypoints == null || waypoints.Length == 0) return;
-            if (currentWaypointIndex >= waypoints.Length) return;
+            if (waypoints == null || currentWaypointIndex >= waypoints.Length) return;
 
-            Transform targetWaypoint = waypoints[currentWaypointIndex];
-            if (targetWaypoint == null) return;
+            float scale = Battlefield.Scale;
+            Vector3 target = waypoints[currentWaypointIndex].position + Vector3.up * (hoverHeight * scale);
+            Vector3 toTarget = target - transform.position;
+            float step = moveSpeed * slowFactor * scale * Time.deltaTime;
 
-            Vector3 targetPosition = targetWaypoint.position;
-            // Mantener la misma altura para un movimiento plano y estable
-            targetPosition.y = transform.position.y;
-
-            Vector3 direction = (targetPosition - transform.position).normalized;
-            float step = moveSpeed * currentSpeedModifier * Time.deltaTime;
-
-            transform.position = Vector3.MoveTowards(transform.position, targetPosition, step);
-
-            // Orientación suave hacia el avance
-            if (direction != Vector3.zero)
+            if (toTarget.sqrMagnitude <= step * step)
             {
-                Quaternion lookRotation = Quaternion.LookRotation(direction);
-                transform.rotation = Quaternion.Slerp(transform.rotation, lookRotation, Time.deltaTime * 10f);
+                transform.position = target;
+                currentWaypointIndex++;
+                if (currentWaypointIndex >= waypoints.Length) ReachStage();
+                return;
             }
 
-            // Comprobar si se ha llegado al waypoint actual
-            if (Vector3.Distance(transform.position, targetPosition) < 0.05f)
-            {
-                currentWaypointIndex++;
+            transform.position += toTarget.normalized * step;
 
-                // Si se alcanzaron todos los waypoints, el enemigo ha llegado al escenario
-                if (currentWaypointIndex >= waypoints.Length)
-                {
-                    ReachStage();
-                }
+            Vector3 flat = new Vector3(toTarget.x, 0f, toTarget.z);
+            if (flat.sqrMagnitude > 0.000001f)
+            {
+                Quaternion look = Quaternion.LookRotation(flat);
+                transform.rotation = Quaternion.Slerp(transform.rotation, look, Time.deltaTime * 10f);
             }
         }
 
         /// <summary>
-        /// Aplica daño al enemigo. Reduce la vida, emite eventos y gestiona la muerte.
+        /// Aplica daño. Emite eventos y gestiona la muerte.
         /// </summary>
         public virtual void TakeDamage(float amount)
         {
-            if (isDead) return;
+            if (isDead || amount <= 0f) return;
 
-            currentHealth -= amount;
-            currentHealth = Mathf.Max(0f, currentHealth);
+            currentHealth = Mathf.Max(0f, currentHealth - amount);
             OnHealthChanged?.Invoke(currentHealth, maxHealth);
 
-            if (currentHealth <= 0f)
-            {
-                Die();
-            }
+            if (currentHealth <= 0f) Die();
         }
 
         /// <summary>
-        /// Ralentiza la velocidad del enemigo durante un tiempo determinado (ej: torre Echo).
+        /// Ralentiza al enemigo durante un tiempo (torre Echo). factor 0.5 = mitad de velocidad.
         /// </summary>
-        public void ApplySlow(float slowFactor, float duration)
+        public void ApplySlow(float factor, float duration)
         {
             if (isDead) return;
 
-            if (slowCoroutine != null)
-            {
-                StopCoroutine(slowCoroutine);
-            }
-            slowCoroutine = StartCoroutine(SlowRoutine(slowFactor, duration));
-        }
-
-        private IEnumerator SlowRoutine(float slowFactor, float duration)
-        {
-            currentSpeedModifier = Mathf.Clamp01(slowFactor);
-            yield return new WaitForSeconds(duration);
-            currentSpeedModifier = 1f;
-            slowCoroutine = null;
+            slowFactor = Mathf.Min(slowFactor, Mathf.Clamp(factor, 0.1f, 1f));
+            slowTimer = Mathf.Max(slowTimer, duration);
         }
 
         /// <summary>
-        /// Aplica un empuje físico al enemigo en una dirección dada (ej: torre Drop).
+        /// Empuje físico (torre Drop, Roller Coaster): el Rigidbody deja de ser cinemático
+        /// un instante y recibe el impulso, en unidades de campo por segundo.
         /// </summary>
-        public void ApplyKnockback(Vector3 force)
+        public void ApplyKnockback(Vector3 velocity)
         {
-            if (isDead) return;
+            if (isDead || rb == null) return;
 
-            if (rb != null && !rb.isKinematic)
-            {
-                rb.AddForce(force, ForceMode.Impulse);
-            }
-            else
-            {
-                // Empuje directo sobre posición si no usa físicas activas
-                transform.position += force * 0.1f;
-            }
+            velocity *= (1f - knockbackResistance) * Battlefield.Scale;
+            velocity.y = 0f;
+            if (velocity.sqrMagnitude < 0.0001f) return;
+
+            rb.isKinematic = false;
+            rb.linearVelocity = Vector3.zero;
+            rb.AddForce(velocity, ForceMode.VelocityChange);
+            knockbackTimer = 0.35f;
         }
 
-        /// <summary>
-        /// Se ejecuta cuando el enemigo alcanza la meta final del escenario.
-        /// </summary>
+        private void EndKnockback()
+        {
+            if (rb == null) return;
+
+            rb.linearVelocity = Vector3.zero;
+            rb.angularVelocity = Vector3.zero;
+            rb.isKinematic = true;
+        }
+
         private void ReachStage()
         {
             if (isDead) return;
             isDead = true;
 
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.TakeStageDamage(stageDamage);
-            }
+            if (GameManager.Instance != null) GameManager.Instance.TakeStageDamage(stageDamage);
 
             OnEnemyReachedEnd?.Invoke(this);
-            Destroy(gameObject);
+            RemoveFromField(false);
         }
 
-        /// <summary>
-        /// Se ejecuta cuando la vida llega a 0. Otorga monedas y reproduce efectos.
-        /// </summary>
         private void Die()
         {
             if (isDead) return;
             isDead = true;
 
-            // Recompensa en monedas
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.AddCoins(coinsReward);
-            }
+            if (GameManager.Instance != null) GameManager.Instance.AddCoins(coinsReward);
 
-            // Efecto visual de muerte
-            if (deathVfxPrefab != null)
-            {
-                Instantiate(deathVfxPrefab, transform.position, Quaternion.identity);
-            }
+            PulseEffect.Spawn(deathVfxPrefab, transform.position, Mathf.Max(1f, transform.localScale.x * 6f));
+            Sfx.Play(SfxId.Impact);
 
             OnEnemyDeath?.Invoke(this);
+            RemoveFromField(true);
+        }
+
+        private void RemoveFromField(bool defeated)
+        {
+            OnRemovedFromField(defeated);
+            OnRemoved?.Invoke(this);
             Destroy(gameObject);
+        }
+
+        /// <summary>
+        /// Gancho para jefes: se llama justo antes de destruir al enemigo.
+        /// </summary>
+        protected virtual void OnRemovedFromField(bool defeated)
+        {
         }
     }
 }

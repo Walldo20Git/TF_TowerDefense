@@ -1,42 +1,39 @@
 using System;
 using UnityEngine;
-using UnityEngine.EventSystems;
 using ConcertDefense.Core;
+using ConcertDefense.Player;
 
 namespace ConcertDefense.Towers
 {
     /// <summary>
-    /// Plataforma sobre la cual el jugador puede construir torres:
-    /// - Verifica la disponibilidad de la plataforma (libre / ocupada).
-    /// - Controla la regla del GDD que exige tener al avatar cerca (parámetro configurable requireAvatarNearby).
-    /// - Instancia la torre seleccionada deduciendo su costo de monedas y libera el espacio si la torre es vendida.
+    /// Plataforma de construcción (GDD 4.2 y 4.3):
+    /// - Sabe si está libre u ocupada y crea la torre elegida descontando su costo.
+    /// - Exige tener al avatar cerca para construir o mejorar (configurable con requireAvatarNearby).
+    /// - Su indicador hace de retícula de torre: verde si se puede construir, rojo si el avatar está lejos.
     /// </summary>
     [RequireComponent(typeof(Collider))]
     public class BuildSpot : MonoBehaviour
     {
         [Header("Reglas de Proximidad (GDD 4.2)")]
-        [Tooltip("Si es true, exige tener al avatar cerca de la plataforma para poder construir o mejorar.")]
+        [Tooltip("Si es true, exige tener al avatar cerca para construir o mejorar. Desactívalo si resulta incómodo.")]
         [SerializeField] private bool requireAvatarNearby = true;
 
-        [Tooltip("Distancia máxima en metros permitida entre el avatar y la plataforma para habilitar la construcción.")]
-        [SerializeField] private float avatarProximityDistance = 1.2f;
+        [Tooltip("Distancia máxima entre el avatar y la plataforma, en unidades de campo.")]
+        [SerializeField] private float avatarProximityDistance = 0.45f;
 
-        [Header("Puntos de Anclaje y Visualización")]
-        [Tooltip("Punto exacto donde se colocará la base de la torre (si es nulo, usa el centro de la plataforma).")]
-        [SerializeField] private Transform towerMountPoint;
+        [Header("Visualización")]
+        [Tooltip("Indicador de plataforma disponible (se oculta al construir).")]
+        [SerializeField] private Renderer availableIndicator;
 
-        [Tooltip("Indicador visual que resalta si la plataforma está disponible para construir.")]
-        [SerializeField] private GameObject availableIndicator;
+        [SerializeField] private Color inRangeColor = new Color(0.1f, 1f, 0.45f, 0.85f);
+        [SerializeField] private Color outOfRangeColor = new Color(1f, 0.2f, 0.25f, 0.85f);
 
-        [Tooltip("Color o material cuando el avatar está en rango (válido / verde anime).")]
-        [SerializeField] private Color inRangeColor = new Color(0f, 1f, 0.8f, 0.6f);
+        private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
 
-        [Tooltip("Color cuando el avatar está fuera de rango (inválido / rojo).")]
-        [SerializeField] private Color outOfRangeColor = new Color(1f, 0.2f, 0.3f, 0.6f);
-
-        // Estado
         private Tower currentTower;
-        private Transform cachedAvatar;
+        private MaterialPropertyBlock block;
+        private bool lastNearby;
+        private bool colorInitialized;
 
         public bool RequireAvatarNearby
         {
@@ -47,166 +44,122 @@ namespace ConcertDefense.Towers
         public bool IsOccupied => currentTower != null;
         public Tower CurrentTower => currentTower;
 
-        // Evento notificado al tocar la plataforma libre para abrir selector de torres
+        /// <summary>Se tocó una plataforma libre con el avatar cerca: abrir el selector de torres.</summary>
         public static event Action<BuildSpot> OnBuildSpotClicked;
 
-        private void Start()
+        private void Awake()
         {
-            if (towerMountPoint == null)
-            {
-                towerMountPoint = transform;
-            }
-
-            FindAvatar();
+            block = new MaterialPropertyBlock();
         }
 
         private void Update()
         {
-            UpdateVisualIndicators();
+            if (availableIndicator == null) return;
+
+            bool free = !IsOccupied;
+            if (availableIndicator.gameObject.activeSelf != free) availableIndicator.gameObject.SetActive(free);
+            if (!free) return;
+
+            bool nearby = IsAvatarNearby();
+            if (colorInitialized && nearby == lastNearby) return;
+
+            colorInitialized = true;
+            lastNearby = nearby;
+            block.SetColor(BaseColorId, nearby ? inRangeColor : outOfRangeColor);
+            availableIndicator.SetPropertyBlock(block);
         }
 
         /// <summary>
-        /// Localiza al avatar en la escena mediante la etiqueta 'Avatar'.
-        /// </summary>
-        private void FindAvatar()
-        {
-            if (cachedAvatar == null)
-            {
-                GameObject avatarObj = GameObject.FindWithTag("Avatar");
-                if (avatarObj != null)
-                {
-                    cachedAvatar = avatarObj.transform;
-                }
-            }
-        }
-
-        /// <summary>
-        /// Verifica si el avatar se encuentra dentro del rango de proximidad requerido.
+        /// ¿Está el avatar lo bastante cerca de la plataforma?
         /// </summary>
         public bool IsAvatarNearby()
         {
             if (!requireAvatarNearby) return true;
 
-            if (cachedAvatar == null)
-            {
-                FindAvatar();
-                if (cachedAvatar == null) return false;
-            }
+            AvatarController avatar = AvatarController.Instance;
+            if (avatar == null) return false;
 
-            float distance = Vector3.Distance(transform.position, cachedAvatar.position);
-            return distance <= avatarProximityDistance;
+            Vector3 delta = avatar.transform.position - transform.position;
+            delta.y = 0f;
+            return delta.magnitude <= avatarProximityDistance * Battlefield.Scale;
         }
 
         /// <summary>
-        /// Actualiza la visualización del indicador según si la plataforma está libre y el avatar cerca.
+        /// Toque del jugador sobre la plataforma (lo enruta TouchInputRouter).
         /// </summary>
-        private void UpdateVisualIndicators()
+        public void HandleTap()
         {
-            if (availableIndicator == null) return;
-
-            // Si ya hay una torre construida, el indicador de plataforma libre permanece oculto
             if (IsOccupied)
             {
-                availableIndicator.SetActive(false);
+                currentTower.Select();
                 return;
             }
 
-            availableIndicator.SetActive(true);
-
-            // Cambiar color según proximidad del avatar
-            Renderer rend = availableIndicator.GetComponent<Renderer>();
-            if (rend != null)
+            if (IsAvatarNearby())
             {
-                rend.material.color = IsAvatarNearby() ? inRangeColor : outOfRangeColor;
+                OnBuildSpotClicked?.Invoke(this);
+                return;
             }
+
+            // El avatar está lejos: va hacia la plataforma por su cuenta
+            if (AvatarController.Instance != null)
+            {
+                AvatarController.Instance.SetDestinationNear(transform.position, avatarProximityDistance * 0.6f);
+            }
+            GameMessages.Show("La heroína va hacia la plataforma. Tócala de nuevo cuando esté en verde.");
         }
 
         /// <summary>
-        /// Instancia una nueva torre en esta plataforma si se cumplen los fondos y la regla de proximidad.
+        /// Construye una torre en la plataforma si hay monedas y el avatar está cerca.
         /// </summary>
         public bool BuildTower(GameObject towerPrefab)
         {
-            if (IsOccupied)
-            {
-                Debug.LogWarning("[BuildSpot] Esta plataforma ya tiene una torre instalada.");
-                return false;
-            }
+            if (IsOccupied || towerPrefab == null || Battlefield.Instance == null) return false;
 
-            if (!IsAvatarNearby())
-            {
-                Debug.LogWarning("[BuildSpot] El avatar está demasiado lejos para construir en esta plataforma.");
-                return false;
-            }
-
-            if (towerPrefab == null)
-            {
-                Debug.LogError("[BuildSpot] No se proporcionó prefab de torre válido.");
-                return false;
-            }
-
-            Tower towerComponent = towerPrefab.GetComponent<Tower>();
-            if (towerComponent == null)
+            Tower prefabTower = towerPrefab.GetComponent<Tower>();
+            if (prefabTower == null)
             {
                 Debug.LogError("[BuildSpot] El prefab asignado no tiene el componente Tower.");
                 return false;
             }
 
-            // Comprobar y descontar monedas
-            int cost = towerComponent.TotalInvestedCoins;
-            if (GameManager.Instance != null && !GameManager.Instance.TrySpendCoins(cost))
+            if (!IsAvatarNearby())
             {
-                Debug.LogWarning($"[BuildSpot] Fondos insuficientes para construir {towerComponent.TowerName}.");
+                GameMessages.Show("Acerca a la heroína a la plataforma para construir.");
                 return false;
             }
 
-            // Instanciar torre en la plataforma
-            Vector3 spawnPos = towerMountPoint != null ? towerMountPoint.position : transform.position;
-            Quaternion spawnRot = towerMountPoint != null ? towerMountPoint.rotation : Quaternion.identity;
+            if (GameManager.Instance == null || !GameManager.Instance.TrySpendCoins(prefabTower.BaseCost))
+            {
+                GameMessages.Show($"Monedas insuficientes: {prefabTower.TowerName} cuesta {prefabTower.BaseCost}.");
+                return false;
+            }
 
-            GameObject newTowerObj = Instantiate(towerPrefab, spawnPos, spawnRot, transform);
-            currentTower = newTowerObj.GetComponent<Tower>();
+            // La torre cuelga del contenedor Towers, no de la plataforma, para no heredar su forma aplastada
+            Transform field = Battlefield.Instance.transform;
+            GameObject obj = Instantiate(towerPrefab, transform.position, field.rotation, Battlefield.Instance.Towers);
+            currentTower = obj.GetComponent<Tower>();
+            currentTower.Spot = this;
 
-            Debug.Log($"[BuildSpot] ¡Torre {currentTower.TowerName} construida con éxito!");
+            Sfx.Play(SfxId.Build);
+            GameMessages.Show($"Torre {currentTower.TowerName} construida.", 1.5f);
             return true;
         }
 
         /// <summary>
-        /// Libera la plataforma para que se pueda construir una nueva torre (llamado al vender).
+        /// Libera la plataforma (al vender la torre).
         /// </summary>
         public void ClearSpot()
         {
             currentTower = null;
-        }
-
-        private void OnMouseDown()
-        {
-            // Ignorar clic si el cursor está sobre un elemento de UI
-            if (EventSystem.current != null && EventSystem.current.IsPointerOverGameObject())
-            {
-                return;
-            }
-
-            // Si está libre, dispara evento para abrir el menú de selección de torre
-            if (!IsOccupied)
-            {
-                if (IsAvatarNearby())
-                {
-                    OnBuildSpotClicked?.Invoke(this);
-                }
-                else
-                {
-                    Debug.Log("[BuildSpot] Acércate con la heroína o desactiva 'requireAvatarNearby' para construir aquí.");
-                }
-            }
+            colorInitialized = false;
         }
 
         private void OnDrawGizmosSelected()
         {
-            if (requireAvatarNearby)
-            {
-                Gizmos.color = Color.yellow;
-                Gizmos.DrawWireSphere(transform.position, avatarProximityDistance);
-            }
+            if (!requireAvatarNearby) return;
+            Gizmos.color = Color.yellow;
+            Gizmos.DrawWireSphere(transform.position, avatarProximityDistance * transform.lossyScale.x);
         }
     }
 }

@@ -1,101 +1,54 @@
 using System;
 using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
+using TMPro;
 using ConcertDefense.Core;
-using ConcertDefense.Enemies;
 
 namespace ConcertDefense.Rhythm
 {
     /// <summary>
-    /// Componente físico del carrito de la montaña rusa que barre el campo dañando enemigos al impactar.
-    /// </summary>
-    [RequireComponent(typeof(Collider))]
-    public class RollerCoasterCart : MonoBehaviour
-    {
-        private float damage = 250f;
-        private float knockback = 15f;
-        private readonly HashSet<Enemy> hitEnemies = new HashSet<Enemy>();
-
-        public void Initialize(float cartDamage, float cartKnockback)
-        {
-            damage = cartDamage;
-            knockback = cartKnockback;
-            hitEnemies.Clear();
-        }
-
-        private void OnTriggerEnter(Collider other)
-        {
-            if (other.CompareTag("Enemy"))
-            {
-                Enemy enemy = other.GetComponent<Enemy>();
-                if (enemy != null && !hitEnemies.Contains(enemy))
-                {
-                    hitEnemies.Add(enemy);
-                    enemy.TakeDamage(damage);
-
-                    Vector3 pushDir = transform.forward + Vector3.up * 0.4f;
-                    enemy.ApplyKnockback(pushDir.normalized * knockback);
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Controlador del ataque especial 'Roller Coaster' (GDD 4.5):
-    /// - Acumula energía del medidor con aciertos rítmicos (RhythmInput) y recarga pasiva.
-    /// - Habilita el botón de activación con efecto de brillo cuando el medidor llega al 100%.
-    /// - Conduce el carrito de montaña rusa a lo largo de las vías atropellando a los glitches.
+    /// Ataque especial "Roller Coaster" (GDD 4.5):
+    /// - El medidor se carga con el combo del botón Beat y, más despacio, con el tiempo (recarga).
+    /// - Con el medidor lleno se activa el botón Ultimate.
+    /// - El carrito recorre la vía por waypoints y daña a los enemigos que toca.
     /// </summary>
     public class UltimateController : MonoBehaviour
     {
         public static UltimateController Instance { get; private set; }
 
-        [Header("Interfaz Screen Space")]
-        [Tooltip("Botón para disparar el ataque especial cuando la carga esté completa.")]
+        [Header("Interfaz")]
         [SerializeField] private Button ultimateButton;
 
-        [Tooltip("Imagen radial o lineal con Fill Amount (0 a 1) que muestra la carga del Ultimate.")]
-        [SerializeField] private Image chargeFillImage;
+        [Tooltip("Relleno del medidor: se estira de abajo arriba según la carga.")]
+        [SerializeField] private RectTransform chargeFill;
 
-        [Tooltip("Efecto de resplandor activo cuando el Ultimate está al 100%.")]
+        [SerializeField] private TextMeshProUGUI chargeLabel;
+
+        [Tooltip("Resplandor visible cuando el Ultimate está listo.")]
         [SerializeField] private GameObject readyVisualEffect;
 
-        [Header("Montaña Rusa y Recorrido")]
-        [Tooltip("GameObject del carrito de la montaña rusa (hijo de Battlefield).")]
-        [SerializeField] private GameObject cartObject;
+        [Header("Montaña Rusa")]
+        [Tooltip("Velocidad del carrito en unidades de campo por segundo.")]
+        [SerializeField] private float cartSpeed = 1.6f;
 
-        [Tooltip("Contenedor padre que almacena los waypoints de la vía en orden.")]
-        [SerializeField] private Transform trackContainer;
+        [Tooltip("Daño a cada enemigo que arrolla.")]
+        [SerializeField] private float cartDamage = 250f;
 
-        [Tooltip("Waypoints manuales de la vía si no se usa contenedor padre.")]
-        [SerializeField] private Transform[] trackWaypoints;
+        [Tooltip("Velocidad de empuje al arrollar.")]
+        [SerializeField] private float knockbackForce = 1.8f;
 
-        [Tooltip("Velocidad de avance del carrito por las vías.")]
-        [SerializeField] private float cartSpeed = 6.5f;
+        [Header("Carga")]
+        [Tooltip("Recarga pasiva por segundo durante una oleada (0.02 = lleno en 50 s).")]
+        [SerializeField] private float passiveChargeRate = 0.02f;
 
-        [Tooltip("Daño masivo causado a cada enemigo que impacta el carrito.")]
-        [SerializeField] private float cartDamage = 300f;
-
-        [Tooltip("Fuerza de empuje físico al arrollar glitches.")]
-        [SerializeField] private float knockbackForce = 15f;
-
-        [Header("Ajustes de Carga")]
-        [Tooltip("Tasa de recarga pasiva por segundo (0.01 = 1% por segundo).")]
-        [SerializeField] private float passiveChargeRate = 0.015f;
-
-        // Estado
-        private float currentCharge = 0f;
-        private bool isCartActive = false;
-        private Coroutine cartRoutine;
-        private RollerCoasterCart cartComponent;
+        private float currentCharge;
+        private bool isCartActive;
 
         public float CurrentCharge => currentCharge;
-        public bool IsReady => currentCharge >= 1.0f;
+        public bool IsReady => currentCharge >= 1f;
         public bool IsCartActive => isCartActive;
 
-        // Eventos
         public event Action<float> OnChargeChanged;
         public event Action OnUltimateReady;
         public event Action OnUltimateExecuted;
@@ -110,107 +63,37 @@ namespace ConcertDefense.Rhythm
             Instance = this;
         }
 
-        private void OnEnable()
-        {
-            RhythmInput.OnUltimateChargeGenerated += AddCharge;
-
-            if (ultimateButton != null)
-            {
-                ultimateButton.onClick.AddListener(TriggerUltimate);
-            }
-        }
-
-        private void OnDisable()
-        {
-            RhythmInput.OnUltimateChargeGenerated -= AddCharge;
-
-            if (ultimateButton != null)
-            {
-                ultimateButton.onClick.RemoveListener(TriggerUltimate);
-            }
-        }
-
         private void Start()
         {
-            ExtractTrackWaypoints();
-
-            if (cartObject != null)
-            {
-                cartComponent = cartObject.GetComponent<RollerCoasterCart>();
-                if (cartComponent == null)
-                {
-                    cartComponent = cartObject.AddComponent<RollerCoasterCart>();
-                }
-                cartObject.SetActive(false);
-            }
-
+            RhythmInput.OnUltimateChargeGenerated += AddCharge;
+            if (ultimateButton != null) ultimateButton.onClick.AddListener(TriggerUltimate);
             UpdateUI();
+        }
+
+        private void OnDestroy()
+        {
+            RhythmInput.OnUltimateChargeGenerated -= AddCharge;
+            if (ultimateButton != null) ultimateButton.onClick.RemoveListener(TriggerUltimate);
+            if (Instance == this) Instance = null;
         }
 
         private void Update()
         {
-            // Recarga pasiva gradual durante la partida activa
-            if (!IsReady && !isCartActive && GameManager.Instance != null && GameManager.Instance.CurrentState == GameState.Playing)
+            bool waveActive = WaveSpawner.Instance != null && WaveSpawner.Instance.IsWaveInProgress;
+            bool playing = GameManager.Instance != null && GameManager.Instance.IsPlaying;
+
+            if (playing && waveActive && !IsReady && !isCartActive)
             {
                 AddCharge(passiveChargeRate * Time.deltaTime);
             }
         }
 
         /// <summary>
-        /// Asigna y extrae las vías del Roller Coaster desde el Battlefield instanciado.
-        /// </summary>
-        public void SetupTrack(Transform trackParent, GameObject cart)
-        {
-            trackContainer = trackParent;
-            cartObject = cart;
-
-            if (cartObject != null)
-            {
-                cartComponent = cartObject.GetComponent<RollerCoasterCart>();
-                if (cartComponent == null)
-                {
-                    cartComponent = cartObject.AddComponent<RollerCoasterCart>();
-                }
-                cartObject.SetActive(false);
-            }
-
-            ExtractTrackWaypoints();
-        }
-
-        private void ExtractTrackWaypoints()
-        {
-            if (trackContainer == null)
-            {
-                GameObject foundTrack = GameObject.Find("RollerCoasterTrack");
-                if (foundTrack != null) trackContainer = foundTrack.transform;
-            }
-
-            if (cartObject == null)
-            {
-                cartObject = GameObject.Find("RollerCoasterCart");
-                if (cartObject != null && cartComponent == null)
-                {
-                    cartComponent = cartObject.GetComponent<RollerCoasterCart>();
-                    if (cartComponent == null) cartComponent = cartObject.AddComponent<RollerCoasterCart>();
-                }
-            }
-
-            if (trackContainer != null && trackContainer.childCount > 0)
-            {
-                trackWaypoints = new Transform[trackContainer.childCount];
-                for (int i = 0; i < trackContainer.childCount; i++)
-                {
-                    trackWaypoints[i] = trackContainer.GetChild(i);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Añade carga al medidor de Ultimate (generada por aciertos de ritmo o pasiva).
+        /// Suma carga al medidor (0–1).
         /// </summary>
         public void AddCharge(float amount)
         {
-            if (isCartActive) return;
+            if (isCartActive || amount <= 0f) return;
 
             bool wasReady = IsReady;
             currentCharge = Mathf.Clamp01(currentCharge + amount);
@@ -218,6 +101,7 @@ namespace ConcertDefense.Rhythm
             if (!wasReady && IsReady)
             {
                 OnUltimateReady?.Invoke();
+                GameMessages.Show("¡Ultimate listo! Pulsa el botón para lanzar el Roller Coaster.");
             }
 
             OnChargeChanged?.Invoke(currentCharge);
@@ -225,99 +109,86 @@ namespace ConcertDefense.Rhythm
         }
 
         /// <summary>
-        /// Activa el ataque especial si la carga está completa y el carrito no está en uso.
+        /// Lanza el Roller Coaster si el medidor está lleno.
         /// </summary>
         public void TriggerUltimate()
         {
             if (!IsReady || isCartActive) return;
 
-            if (trackWaypoints == null || trackWaypoints.Length == 0)
-            {
-                ExtractTrackWaypoints();
-            }
+            Battlefield field = Battlefield.Instance;
+            if (field == null || field.RollerCoasterCart == null) return;
 
-            if (cartObject == null || trackWaypoints == null || trackWaypoints.Length < 2)
+            Transform[] track = field.GetTrackWaypoints();
+            if (track.Length < 2)
             {
-                Debug.LogWarning("[UltimateController] No hay vía o carrito configurado para el Roller Coaster.");
+                Debug.LogWarning("[UltimateController] La vía del Roller Coaster no tiene waypoints.");
                 return;
             }
 
             currentCharge = 0f;
-            UpdateUI();
-
+            OnChargeChanged?.Invoke(currentCharge);
             OnUltimateExecuted?.Invoke();
-
-            if (cartRoutine != null)
-            {
-                StopCoroutine(cartRoutine);
-            }
-            cartRoutine = StartCoroutine(RollerCoasterRoutine());
+            Sfx.Play(SfxId.Ultimate);
+            StartCoroutine(CartRoutine(field.RollerCoasterCart, track));
         }
 
-        /// <summary>
-        /// Corrutina que traslada el carrito por cada waypoint de la montaña rusa a alta velocidad.
-        /// </summary>
-        private IEnumerator RollerCoasterRoutine()
+        private IEnumerator CartRoutine(GameObject cart, Transform[] track)
         {
             isCartActive = true;
+            UpdateUI();
 
-            if (cartComponent != null)
+            // El carrito se mueve en coordenadas locales del campo: sigue funcionando si el campo se escala o rota
+            Transform cartTransform = cart.transform;
+            cartTransform.localPosition = track[0].localPosition;
+            cart.SetActive(true);
+
+            RollerCoasterCart cartComponent = cart.GetComponent<RollerCoasterCart>();
+            if (cartComponent != null) cartComponent.Initialize(cartDamage, knockbackForce);
+
+            for (int i = 1; i < track.Length; i++)
             {
-                cartComponent.Initialize(cartDamage, knockbackForce);
-            }
+                Vector3 target = track[i].localPosition;
 
-            cartObject.SetActive(true);
-            cartObject.transform.position = trackWaypoints[0].position;
-            cartObject.transform.rotation = trackWaypoints[0].rotation;
-
-            int targetIndex = 1;
-
-            while (targetIndex < trackWaypoints.Length)
-            {
-                Transform targetWaypoint = trackWaypoints[targetIndex];
-                if (targetWaypoint == null) break;
-
-                while (Vector3.Distance(cartObject.transform.position, targetWaypoint.position) > 0.05f)
+                while (cartTransform != null && (cartTransform.localPosition - target).sqrMagnitude > 0.00001f)
                 {
-                    // Orientar y mover hacia el punto
-                    Vector3 dir = (targetWaypoint.position - cartObject.transform.position).normalized;
-                    if (dir != Vector3.zero)
+                    Vector3 direction = target - cartTransform.localPosition;
+                    if (direction.sqrMagnitude > 0.000001f)
                     {
-                        cartObject.transform.rotation = Quaternion.Slerp(cartObject.transform.rotation, Quaternion.LookRotation(dir), Time.deltaTime * 18f);
+                        Quaternion look = Quaternion.LookRotation(direction.normalized);
+                        cartTransform.localRotation = Quaternion.Slerp(cartTransform.localRotation, look, Time.deltaTime * 14f);
                     }
 
-                    cartObject.transform.position = Vector3.MoveTowards(cartObject.transform.position, targetWaypoint.position, cartSpeed * Time.deltaTime);
+                    cartTransform.localPosition = Vector3.MoveTowards(cartTransform.localPosition, target, cartSpeed * Time.deltaTime);
                     yield return null;
                 }
 
-                targetIndex++;
+                if (cartTransform == null) break;
             }
 
-            // Al completar la vía, ocultar el carrito
-            cartObject.SetActive(false);
+            if (cart != null) cart.SetActive(false);
             isCartActive = false;
-            cartRoutine = null;
             UpdateUI();
-
-            Debug.Log("[UltimateController] Ataque Roller Coaster finalizado.");
         }
 
         private void UpdateUI()
         {
-            if (chargeFillImage != null)
+            bool ready = IsReady && !isCartActive;
+
+            if (chargeFill != null)
             {
-                chargeFillImage.fillAmount = currentCharge;
+                chargeFill.anchorMin = Vector2.zero;
+                chargeFill.anchorMax = new Vector2(1f, currentCharge);
+                chargeFill.offsetMin = Vector2.zero;
+                chargeFill.offsetMax = Vector2.zero;
             }
 
-            if (ultimateButton != null)
+            if (chargeLabel != null)
             {
-                ultimateButton.interactable = IsReady && !isCartActive;
+                chargeLabel.text = isCartActive ? "ROLLER\nCOASTER" : (ready ? "ULTIMATE\n¡LISTO!" : $"ULTIMATE\n{Mathf.FloorToInt(currentCharge * 100f)}%");
             }
 
-            if (readyVisualEffect != null)
-            {
-                readyVisualEffect.SetActive(IsReady && !isCartActive);
-            }
+            if (ultimateButton != null) ultimateButton.interactable = ready;
+            if (readyVisualEffect != null) readyVisualEffect.SetActive(ready);
         }
     }
 }

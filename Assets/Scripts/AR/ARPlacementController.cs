@@ -2,229 +2,198 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
-using UnityEngine.EventSystems;
 using ConcertDefense.Core;
-using ConcertDefense.Rhythm;
 
 namespace ConcertDefense.AR
 {
     /// <summary>
-    /// Controla el escaneo de superficies AR, la proyección de la retícula en el centro
-    /// de la pantalla y la colocación del prefab principal del campo de batalla (Battlefield).
+    /// Escaneo, retícula y colocación del campo (GDD 4.1): Scanning → Placing → Playing.
+    /// La retícula sigue el centro de la pantalla con ARRaycastManager contra PlaneWithinPolygon;
+    /// un toque fija el prefab Battlefield. Sin AR disponible (editor de Unity o dispositivo sin ARCore)
+    /// se activa un modo de prueba con el campo delante de la cámara.
     /// </summary>
     [RequireComponent(typeof(ARRaycastManager))]
     public class ARPlacementController : MonoBehaviour
     {
-        [Header("Referencias AR")]
-        [Tooltip("Gestor de raycasts de AR Foundation (asignado automáticamente si está en el mismo GameObject).")]
-        [SerializeField] private ARRaycastManager raycastManager;
+        public static ARPlacementController Instance { get; private set; }
 
-        [Tooltip("Gestor de planos AR (opcional, para ocultar los planos tras colocar el campo).")]
+        [Header("Referencias AR")]
+        [SerializeField] private ARRaycastManager raycastManager;
+        [Tooltip("Opcional: se usa para ocultar los planos tras colocar el campo.")]
         [SerializeField] private ARPlaneManager planeManager;
 
-        [Header("Elementos de Colocación")]
-        [Tooltip("Objeto visual de la retícula que sigue los planos detectados.")]
-        [SerializeField] private GameObject placementReticle;
+        [Header("Colocación")]
+        [Tooltip("Retícula que sigue los planos detectados.")]
+        [SerializeField] private PlacementReticle placementReticle;
 
-        [Tooltip("Prefab del campo de batalla que contiene todo el escenario, waypoints y plataformas.")]
+        [Tooltip("Prefab padre del campo de batalla.")]
         [SerializeField] private GameObject battlefieldPrefab;
 
-        [Header("Ajustes")]
-        [Tooltip("Si es true, desactiva la visualización de planos una vez colocado el escenario para mayor inmersión.")]
+        [Tooltip("Oculta las mallas de los planos una vez colocado el campo.")]
         [SerializeField] private bool hidePlanesAfterPlacement = true;
 
-        // Instancia instanciada del campo de batalla
-        private GameObject spawnedBattlefield;
+        [Header("Modo sin AR (editor / dispositivo no compatible)")]
+        [Tooltip("Posición de la cámara respecto al campo cuando no hay AR.")]
+        [SerializeField] private Vector3 fallbackCameraOffset = new Vector3(0f, 1.05f, -1.15f);
 
-        // Lista caché para almacenar los impactos de ARRaycast
         private static readonly List<ARRaycastHit> s_Hits = new List<ARRaycastHit>();
 
-        // Estado del raycast actual
-        private bool placementPoseIsValid = false;
+        private GameObject spawnedBattlefield;
         private Pose placementPose;
+        private bool placementPoseIsValid;
+        private bool fallbackMode;
+        private bool fallbackCameraSet;
+        private float enabledTime;
 
         public GameObject SpawnedBattlefield => spawnedBattlefield;
-        public bool IsPlaced => spawnedBattlefield != null;
+        public bool IsPlaced => spawnedBattlefield != null && spawnedBattlefield.activeSelf;
+        public bool HasValidPose => placementPoseIsValid;
+        /// <summary>True cuando no hay sesión AR y se juega con la cámara fija de prueba.</summary>
+        public bool IsFallbackMode => fallbackMode;
 
         private void Awake()
         {
-            if (raycastManager == null)
-            {
-                raycastManager = GetComponent<ARRaycastManager>();
-            }
+            Instance = this;
+            if (raycastManager == null) raycastManager = GetComponent<ARRaycastManager>();
+            if (planeManager == null) planeManager = GetComponent<ARPlaneManager>();
+        }
 
-            if (planeManager == null)
-            {
-                planeManager = GetComponent<ARPlaneManager>();
-            }
+        private void OnEnable()
+        {
+            enabledTime = Time.unscaledTime;
+        }
 
-            // Destruir el Object Spawner predeterminado del template AR para evitar cubos azules al hacer clic
-            GameObject spawner = GameObject.Find("Object Spawner");
-            if (spawner != null)
-            {
-                spawner.SetActive(false);
-                Destroy(spawner);
-            }
+        private void OnDestroy()
+        {
+            if (Instance == this) Instance = null;
         }
 
         private void Start()
         {
-            if (placementReticle != null)
-            {
-                placementReticle.SetActive(false);
-            }
-
-            // Si el escenario ya está en la escena (preexistente o guardado en la escena), auto-vincularlo y pasar a Playing
-            if (spawnedBattlefield == null)
-            {
-                GameObject existing = GameObject.Find("Battlefield(Clone)");
-                if (existing == null) existing = GameObject.Find("Battlefield");
-                if (existing != null)
-                {
-                    spawnedBattlefield = existing;
-                    BindBattlefieldComponents(spawnedBattlefield);
-                    if (GameManager.Instance != null)
-                    {
-                        GameManager.Instance.ChangeState(GameState.Playing);
-                    }
-                    Debug.Log("<color=#00FF88><b>[ARPlacementController] Battlefield preexistente detectado. Juego iniciado en estado Playing con HUD activo.</b></color>");
-                }
-            }
+            if (placementReticle != null) placementReticle.gameObject.SetActive(false);
         }
 
         private void Update()
         {
-            // Si el escenario ya está colocado, garantizar estado Playing, ocultar retícula y no procesar escaneo
+            GameManager gm = GameManager.Instance;
+            if (gm == null) return;
+            if (gm.CurrentState == GameState.GameOver || gm.CurrentState == GameState.Victory) return;
+
             if (IsPlaced)
             {
-                if (placementReticle != null && placementReticle.activeSelf)
+                if (placementReticle != null && placementReticle.gameObject.activeSelf)
                 {
-                    placementReticle.SetActive(false);
+                    placementReticle.gameObject.SetActive(false);
                 }
-                if (GameManager.Instance != null && GameManager.Instance.CurrentState != GameState.Playing)
-                {
-                    GameManager.Instance.ChangeState(GameState.Playing);
-                }
+                if (hidePlanesAfterPlacement) SetPlanesVisible(false);
                 return;
             }
 
             UpdatePlacementPose();
-            UpdatePlacementReticle();
+            UpdateReticle();
 
-            // Detectar toque para fijar el escenario si la posición de la retícula es válida
-            if (placementPoseIsValid && TryGetTouchInput(out Vector2 screenPosition))
-            {
-                if (!IsPointerOverUI(screenPosition))
-                {
-                    PlaceBattlefield();
-                }
-            }
+            gm.ChangeState(placementPoseIsValid ? GameState.Placing : GameState.Scanning);
 
-            #if UNITY_EDITOR
-            if (!IsPlaced && Input.GetKeyDown(KeyCode.Space))
+            if (!placementPoseIsValid) return;
+
+            // Un toque (fuera de la UI) fija el campo. Espacio hace lo mismo en el editor.
+            bool tapped = PointerInput.PrimaryDown(out Vector2 screenPosition) && !PointerInput.IsOverUI(screenPosition);
+            if (tapped || PointerInput.SpacePressed)
             {
-                placementPose = new Pose(new Vector3(0f, 0f, 1.2f), Quaternion.identity);
                 PlaceBattlefield();
             }
-            #endif
         }
 
         /// <summary>
-        /// Lanza un raycast desde el centro de la pantalla hacia los planos detectados por ARCore.
-        /// En el Editor de Unity, proyecta un raycast hacia el plano Y=0 para poder probar con un solo clic.
+        /// Raycast desde el centro de la pantalla contra los planos detectados.
         /// </summary>
         private void UpdatePlacementPose()
         {
-            Vector2 screenCenter = new Vector2(Screen.width * 0.5f, Screen.height * 0.5f);
-
-            bool hitAR = raycastManager != null && raycastManager.Raycast(screenCenter, s_Hits, TrackableType.PlaneWithinPolygon);
-
-            if (hitAR)
-            {
-                placementPoseIsValid = true;
-                placementPose = s_Hits[0].pose;
-
-                // Orientar la retícula hacia adelante de la cámara pero plana sobre el plano horizontal
-                Vector3 cameraForward = Camera.main != null ? Camera.main.transform.forward : Vector3.forward;
-                Vector3 cameraBearing = new Vector3(cameraForward.x, 0f, cameraForward.z).normalized;
-
-                if (cameraBearing != Vector3.zero)
-                {
-                    placementPose.rotation = Quaternion.LookRotation(cameraBearing, placementPose.up);
-                }
-
-                // Notificar al GameManager que pasamos a estado de colocación lista
-                if (GameManager.Instance != null && GameManager.Instance.CurrentState == GameState.Scanning)
-                {
-                    GameManager.Instance.ChangeState(GameState.Placing);
-                }
-            }
-            #if UNITY_EDITOR
-            else if (Application.isEditor)
-            {
-                // Soporte para pruebas directas en el Editor de Unity sin requerir móvil AR
-                Camera cam = Camera.main;
-                if (cam != null)
-                {
-                    Vector3 mousePos = Input.mousePosition;
-                    if (mousePos.x >= 0 && mousePos.x <= Screen.width && mousePos.y >= 0 && mousePos.y <= Screen.height)
-                    {
-                        Ray ray = cam.ScreenPointToRay(mousePos);
-                        Plane groundPlane = new Plane(Vector3.up, Vector3.zero);
-
-                        if (groundPlane.Raycast(ray, out float enter))
-                        {
-                            placementPoseIsValid = true;
-                            placementPose = new Pose(ray.GetPoint(enter), Quaternion.identity);
-
-                            if (GameManager.Instance != null && GameManager.Instance.CurrentState == GameState.Scanning)
-                            {
-                                GameManager.Instance.ChangeState(GameState.Placing);
-                            }
-                        }
-                    }
-                }
-            }
-            #endif
-            else
+            Camera cam = Camera.main;
+            if (cam == null)
             {
                 placementPoseIsValid = false;
-
-                // Si perdimos el plano, volvemos a estado de escaneo
-                if (GameManager.Instance != null && GameManager.Instance.CurrentState == GameState.Placing)
-                {
-                    GameManager.Instance.ChangeState(GameState.Scanning);
-                }
+                return;
             }
+
+            var screenCenter = new Vector2(Screen.width * 0.5f, Screen.height * 0.5f);
+
+            if (raycastManager != null && raycastManager.Raycast(screenCenter, s_Hits, TrackableType.PlaneWithinPolygon))
+            {
+                fallbackMode = false;
+                placementPoseIsValid = true;
+                placementPose = new Pose(s_Hits[0].pose.position, YawTowards(cam.transform.forward));
+                return;
+            }
+
+            if (IsArUnavailable())
+            {
+                // Modo de prueba: el campo se coloca en el origen y la cámara lo mira desde arriba
+                fallbackMode = true;
+                placementPoseIsValid = true;
+                placementPose = new Pose(Vector3.zero, Quaternion.identity);
+                SetupFallbackCamera(cam);
+                return;
+            }
+
+            // AR activo pero sin superficie bajo el centro: retícula roja flotando delante de la cámara
+            fallbackMode = false;
+            placementPoseIsValid = false;
+            Vector3 ahead = cam.transform.position + cam.transform.forward * 1.2f;
+            ahead.y = cam.transform.position.y - 0.5f;
+            placementPose = new Pose(ahead, YawTowards(cam.transform.forward));
+        }
+
+        private static Quaternion YawTowards(Vector3 forward)
+        {
+            var bearing = new Vector3(forward.x, 0f, forward.z);
+            return bearing.sqrMagnitude > 0.0001f ? Quaternion.LookRotation(bearing.normalized, Vector3.up) : Quaternion.identity;
         }
 
         /// <summary>
-        /// Muestra u oculta la retícula y actualiza su posición según el raycast.
+        /// No hay AR si el dispositivo no es compatible o si, en el editor, la sesión no llega a arrancar.
         /// </summary>
-        private void UpdatePlacementReticle()
+        private bool IsArUnavailable()
+        {
+            ARSessionState state = ARSession.state;
+            if (state == ARSessionState.Unsupported) return true;
+
+            bool sessionRunning = state == ARSessionState.Ready ||
+                                  state == ARSessionState.SessionInitializing ||
+                                  state == ARSessionState.SessionTracking;
+
+            return Application.isEditor && !sessionRunning && Time.unscaledTime - enabledTime > 1f;
+        }
+
+        private void SetupFallbackCamera(Camera cam)
+        {
+            if (fallbackCameraSet) return;
+            fallbackCameraSet = true;
+
+            cam.transform.position = fallbackCameraOffset;
+            cam.transform.rotation = Quaternion.LookRotation(new Vector3(0f, 0.02f, 0.05f) - fallbackCameraOffset, Vector3.up);
+        }
+
+        private void UpdateReticle()
         {
             if (placementReticle == null) return;
 
-            if (placementPoseIsValid)
-            {
-                placementReticle.SetActive(true);
-                placementReticle.transform.SetPositionAndRotation(placementPose.position, placementPose.rotation);
-            }
-            else
-            {
-                placementReticle.SetActive(false);
-            }
+            if (!placementReticle.gameObject.activeSelf) placementReticle.gameObject.SetActive(true);
+            placementReticle.transform.SetPositionAndRotation(placementPose.position, placementPose.rotation);
+            placementReticle.SetValid(placementPoseIsValid);
         }
 
         /// <summary>
-        /// Instancia el prefab del campo de batalla en la posición del plano y pasa al estado Playing.
+        /// Coloca (o reubica) el campo en la pose actual de la retícula. Devuelve false si no hay punto válido.
         /// </summary>
-        public void PlaceBattlefield()
+        public bool PlaceBattlefield()
         {
+            if (!placementPoseIsValid) return false;
+
             if (battlefieldPrefab == null)
             {
-                Debug.LogError("[ARPlacementController] No se ha asignado el prefab del campo de batalla (battlefieldPrefab).");
-                return;
+                Debug.LogError("[ARPlacementController] Falta asignar el prefab Battlefield.");
+                return false;
             }
 
             if (spawnedBattlefield == null)
@@ -233,128 +202,39 @@ namespace ConcertDefense.AR
             }
             else
             {
-                // Si ya existía (ej. reubicación), movemos el existente
                 spawnedBattlefield.transform.SetPositionAndRotation(placementPose.position, placementPose.rotation);
                 spawnedBattlefield.SetActive(true);
             }
 
-            // Ocultar retícula
-            if (placementReticle != null)
-            {
-                placementReticle.SetActive(false);
-            }
+            if (placementReticle != null) placementReticle.gameObject.SetActive(false);
+            if (hidePlanesAfterPlacement) SetPlanesVisible(false);
 
-            // Ocultar mallas de planos para limpiar la vista
-            if (hidePlanesAfterPlacement && planeManager != null)
-            {
-                SetAllPlanesActive(false);
-            }
-
-            // Vincular automáticamente waypoints, contenedor de enemigos y vías de montaña rusa al WaveSpawner y UltimateController
-            BindBattlefieldComponents(spawnedBattlefield);
-
-            // Notificar al GameManager que el escenario está colocado y el juego comienza
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.ChangeState(GameState.Playing);
-            }
-
-            Debug.Log("[ARPlacementController] Campo de batalla colocado con éxito en la superficie AR.");
-        }
-
-        private void BindBattlefieldComponents(GameObject bf)
-        {
-            if (bf == null) return;
-
-            Transform pathContainer = bf.transform.Find("Path");
-            Transform enemiesContainer = bf.transform.Find("EnemiesContainer");
-            if (WaveSpawner.Instance != null && pathContainer != null)
-            {
-                WaveSpawner.Instance.SetupPathAndContainers(pathContainer, enemiesContainer);
-            }
-
-            Transform trackContainer = bf.transform.Find("RollerCoasterTrack");
-            Transform cartTransform = bf.transform.Find("RollerCoasterCart");
-            if (UltimateController.Instance != null && trackContainer != null && cartTransform != null)
-            {
-                UltimateController.Instance.SetupTrack(trackContainer, cartTransform.gameObject);
-            }
+            if (GameManager.Instance != null) GameManager.Instance.ChangeState(GameState.Playing);
+            GameMessages.Show("¡Escenario colocado! Toca una plataforma para construir y pulsa INICIAR OLEADA.", 4f);
+            return true;
         }
 
         /// <summary>
-        /// Permite reiniciar la colocación si el jugador desea reubicar el campo.
+        /// Vuelve al modo de colocación para reubicar el campo (solo entre oleadas).
         /// </summary>
         public void ResetPlacement()
         {
-            if (spawnedBattlefield != null)
-            {
-                spawnedBattlefield.SetActive(false);
-            }
+            if (WaveSpawner.Instance != null && WaveSpawner.Instance.IsWaveInProgress) return;
+            if (spawnedBattlefield == null) return;
 
-            if (hidePlanesAfterPlacement && planeManager != null)
-            {
-                SetAllPlanesActive(true);
-            }
-
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.ChangeState(GameState.Scanning);
-            }
+            spawnedBattlefield.SetActive(false);
+            if (hidePlanesAfterPlacement) SetPlanesVisible(true);
+            if (GameManager.Instance != null) GameManager.Instance.ChangeState(GameState.Scanning);
         }
 
-        /// <summary>
-        /// Activa o desactiva la visualización de los planos detectados.
-        /// </summary>
-        private void SetAllPlanesActive(bool active)
+        private void SetPlanesVisible(bool visible)
         {
-            foreach (var plane in planeManager.trackables)
+            if (planeManager == null) return;
+
+            foreach (ARPlane plane in planeManager.trackables)
             {
-                plane.gameObject.SetActive(active);
+                if (plane.gameObject.activeSelf != visible) plane.gameObject.SetActive(visible);
             }
-        }
-
-        /// <summary>
-        /// Detecta toques en pantalla de forma compatible tanto con el nuevo Input System como con el modo Both/Legacy.
-        /// </summary>
-        private bool TryGetTouchInput(out Vector2 screenPosition)
-        {
-            // Detección móvil por toques
-            if (Input.touchCount > 0)
-            {
-                Touch touch = Input.GetTouch(0);
-                if (touch.phase == TouchPhase.Began)
-                {
-                    screenPosition = touch.position;
-                    return true;
-                }
-            }
-
-            // Detección para pruebas en el editor de Unity mediante ratón
-            if (Input.GetMouseButtonDown(0))
-            {
-                screenPosition = Input.mousePosition;
-                return true;
-            }
-
-            screenPosition = default;
-            return false;
-        }
-
-        /// <summary>
-        /// Comprueba si el toque se produjo sobre un elemento de la interfaz de usuario para no confundirlo con una acción en el mundo 3D.
-        /// </summary>
-        private bool IsPointerOverUI(Vector2 screenPosition)
-        {
-            if (EventSystem.current == null) return false;
-
-            PointerEventData eventData = new PointerEventData(EventSystem.current)
-            {
-                position = screenPosition
-            };
-
-            List<RaycastResult> results = new List<RaycastResult>();
-            EventSystem.current.RaycastAll(eventData, results);
-            return results.Count > 0;
         }
     }
 }

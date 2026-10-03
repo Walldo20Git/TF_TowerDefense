@@ -1,245 +1,194 @@
 using System;
 using System.Collections;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
 using TMPro;
+using ConcertDefense.Core;
 using ConcertDefense.Towers;
 
 namespace ConcertDefense.Rhythm
 {
     /// <summary>
-    /// Gestiona la interacción del jugador con el botón rítmico (GDD 4.4):
-    /// - Evalúa las pulsaciones contra el BeatClock (Perfect, Good, Miss).
-    /// - Mantiene el contador de Combo y actualiza los textos visuales de retroalimentación.
-    /// - Aplica el multiplicador de 1.5x de daño a las torres durante el compás al acertar Perfect.
-    /// - Genera carga para el Ultimate (Roller Coaster) proporcional al combo y precisión.
-    /// - Anima visualmente el botón al pulso del metrónomo.
+    /// Botón Beat (GDD 4.4):
+    /// - Evalúa cada toque contra el BeatClock (Perfect, Good, Miss).
+    /// - Perfect aplica ×1.5 de daño a todas las torres durante ese compás.
+    /// - Los aciertos seguidos forman un combo que carga el Ultimate.
     /// </summary>
     public class RhythmInput : MonoBehaviour
     {
         public static RhythmInput Instance { get; private set; }
 
         [Header("Referencias de UI")]
-        [Tooltip("Botón principal de ritmo (independiente de los toques sobre el campo 3D).")]
+        [Tooltip("Botón Beat (independiente de los toques sobre el campo).")]
         [SerializeField] private Button beatButton;
 
-        [Tooltip("Texto para mostrar la calificación del acierto (PERFECT / GOOD / MISS).")]
+        [Tooltip("Texto con la calificación del toque (PERFECT / GOOD / MISS).")]
         [SerializeField] private TextMeshProUGUI feedbackText;
 
-        [Tooltip("Texto que muestra la racha de combo actual.")]
+        [Tooltip("Texto con el combo actual.")]
         [SerializeField] private TextMeshProUGUI comboText;
 
-        [Tooltip("Transform o imagen de anillo que palpita con el compás de la música.")]
+        [Tooltip("Anillo que se cierra sobre el botón al llegar cada tiempo.")]
         [SerializeField] private RectTransform pulseRing;
 
-        [Header("Parámetros de Recompensa de Carga Ultimate")]
-        [Tooltip("Porcentaje de carga de Ultimate otorgado por un PERFECT (0.05 = 5%).")]
+        [Header("Carga de Ultimate por acierto")]
         [SerializeField] private float perfectChargeAmount = 0.06f;
-
-        [Tooltip("Porcentaje de carga de Ultimate otorgado por un GOOD (0.03 = 3%).")]
         [SerializeField] private float goodChargeAmount = 0.03f;
 
-        [Header("Paleta Visual Anime")]
-        [SerializeField] private Color perfectColor = new Color(0f, 1f, 0.9f); // Turquesa
-        [SerializeField] private Color goodColor = new Color(1f, 0.2f, 0.7f);    // Magenta
-        [SerializeField] private Color missColor = new Color(0.6f, 0.6f, 0.6f);  // Gris neutro
+        [Header("Paleta")]
+        [SerializeField] private Color perfectColor = new Color(0f, 1f, 0.9f);
+        [SerializeField] private Color goodColor = new Color(1f, 0.2f, 0.7f);
+        [SerializeField] private Color missColor = new Color(0.7f, 0.7f, 0.75f);
 
-        // Variables de estado
-        private int currentCombo = 0;
-        private int maxCombo = 0;
-        private Coroutine feedbackFadeCoroutine;
-        private Coroutine rhythmBoostCoroutine;
+        private int currentCombo;
+        private int maxCombo;
+        private int lastScoredBeat = -1;
+        private float boostTimer;
+        private Coroutine feedbackRoutine;
+        private PointerDownRelay relay;
 
         public int CurrentCombo => currentCombo;
         public int MaxCombo => maxCombo;
 
-        // Eventos
         public static event Action<HitAccuracy, int> OnRhythmHit;
         public static event Action<float> OnUltimateChargeGenerated;
 
         private void Awake()
         {
-            if (Instance != null && Instance != this)
-            {
-                Destroy(gameObject);
-                return;
-            }
             Instance = this;
-        }
-
-        private void OnEnable()
-        {
-            if (beatButton != null)
-            {
-                beatButton.onClick.AddListener(OnBeatPressed);
-            }
-
-            if (BeatClock.Instance != null)
-            {
-                BeatClock.Instance.OnBeatPulse += AnimatePulseRing;
-            }
-        }
-
-        private void OnDisable()
-        {
-            if (beatButton != null)
-            {
-                beatButton.onClick.RemoveListener(OnBeatPressed);
-            }
-
-            if (BeatClock.Instance != null)
-            {
-                BeatClock.Instance.OnBeatPulse -= AnimatePulseRing;
-            }
+            Tower.RhythmMultiplier = 1f;
         }
 
         private void Start()
         {
-            UpdateComboUI();
-
-            if (feedbackText != null)
+            if (beatButton != null)
             {
-                feedbackText.text = "";
+                relay = beatButton.gameObject.GetComponent<PointerDownRelay>();
+                if (relay == null) relay = beatButton.gameObject.AddComponent<PointerDownRelay>();
+                relay.OnDown += OnBeatPressed;
+            }
+
+            BeatClock.OnBeatPulse += AnimatePulseRing;
+
+            if (feedbackText != null) feedbackText.text = "";
+            UpdateComboUI();
+        }
+
+        private void OnDestroy()
+        {
+            if (relay != null) relay.OnDown -= OnBeatPressed;
+            BeatClock.OnBeatPulse -= AnimatePulseRing;
+            Tower.RhythmMultiplier = 1f;
+            if (Instance == this) Instance = null;
+        }
+
+        private void Update()
+        {
+            // Atajo de teclado para probar en el editor
+            if (PointerInput.BeatKeyPressed) OnBeatPressed();
+
+            if (boostTimer > 0f)
+            {
+                boostTimer -= Time.deltaTime;
+                if (boostTimer <= 0f) Tower.RhythmMultiplier = 1f;
             }
         }
 
         /// <summary>
-        /// Ejecutado cada vez que el usuario presiona el botón Beat en la pantalla.
+        /// Se ejecuta al apoyar el dedo sobre el botón Beat.
         /// </summary>
         public void OnBeatPressed()
         {
-            if (BeatClock.Instance == null || !BeatClock.Instance.IsRunning) return;
+            if (!BeatClock.IsRunning)
+            {
+                GameMessages.Show("El ritmo empieza cuando coloques el escenario.");
+                return;
+            }
 
-            HitAccuracy accuracy = BeatClock.Instance.EvaluateTap(out float offset);
+            HitAccuracy accuracy = BeatClock.Instance.EvaluateTap(out _, out int beat);
+
+            // Un mismo tiempo solo puntúa una vez: machacar el botón no da combo
+            if (accuracy != HitAccuracy.Miss && beat == lastScoredBeat) return;
 
             switch (accuracy)
             {
                 case HitAccuracy.Perfect:
+                    lastScoredBeat = beat;
                     currentCombo++;
-                    maxCombo = Mathf.Max(maxCombo, currentCombo);
-                    ApplyPerfectDamageBoost();
+                    Tower.RhythmMultiplier = 1.5f;
+                    boostTimer = BeatClock.Instance.SecondsPerBeat;
                     AddUltimateCharge(perfectChargeAmount);
                     ShowFeedback("PERFECT!", perfectColor);
+                    Sfx.Play(SfxId.Perfect);
                     break;
 
                 case HitAccuracy.Good:
+                    lastScoredBeat = beat;
                     currentCombo++;
-                    maxCombo = Mathf.Max(maxCombo, currentCombo);
                     AddUltimateCharge(goodChargeAmount);
                     ShowFeedback("GOOD", goodColor);
+                    Sfx.Play(SfxId.Good);
                     break;
 
-                case HitAccuracy.Miss:
+                default:
                     currentCombo = 0;
                     ShowFeedback("MISS", missColor);
                     break;
             }
 
+            maxCombo = Mathf.Max(maxCombo, currentCombo);
             UpdateComboUI();
             OnRhythmHit?.Invoke(accuracy, currentCombo);
         }
 
-        /// <summary>
-        /// Aplica un multiplicador de 1.5x de daño a todas las torres durante el compás actual.
-        /// </summary>
-        private void ApplyPerfectDamageBoost()
-        {
-            if (rhythmBoostCoroutine != null)
-            {
-                StopCoroutine(rhythmBoostCoroutine);
-            }
-
-            rhythmBoostCoroutine = StartCoroutine(RhythmBoostRoutine());
-        }
-
-        private IEnumerator RhythmBoostRoutine()
-        {
-            Tower[] allTowers = FindObjectsByType<Tower>(FindObjectsSortMode.None);
-            foreach (var tower in allTowers)
-            {
-                tower.SetRhythmMultiplier(1.5f);
-            }
-
-            // Mantener el bono durante la duración de un pulso de compás
-            float duration = BeatClock.Instance != null ? BeatClock.Instance.SecondsPerBeat : 0.5f;
-            yield return new WaitForSeconds(duration);
-
-            foreach (var tower in allTowers)
-            {
-                if (tower != null)
-                {
-                    tower.SetRhythmMultiplier(1.0f);
-                }
-            }
-
-            rhythmBoostCoroutine = null;
-        }
-
         private void AddUltimateCharge(float baseAmount)
         {
-            // Bonus adicional ligero según el combo acumulado
+            // El combo acumulado da un pequeño extra
             float comboBonus = Mathf.Min(0.04f, currentCombo * 0.002f);
-            float totalCharge = baseAmount + comboBonus;
-            OnUltimateChargeGenerated?.Invoke(totalCharge);
+            OnUltimateChargeGenerated?.Invoke(baseAmount + comboBonus);
         }
 
         private void ShowFeedback(string message, Color color)
         {
             if (feedbackText == null) return;
 
-            if (feedbackFadeCoroutine != null)
-            {
-                StopCoroutine(feedbackFadeCoroutine);
-            }
-
-            feedbackFadeCoroutine = StartCoroutine(FeedbackFadeRoutine(message, color));
+            if (feedbackRoutine != null) StopCoroutine(feedbackRoutine);
+            feedbackRoutine = StartCoroutine(FeedbackRoutine(message, color));
         }
 
-        private IEnumerator FeedbackFadeRoutine(string message, Color color)
+        private IEnumerator FeedbackRoutine(string message, Color color)
         {
             feedbackText.text = message;
             feedbackText.color = color;
-            feedbackText.transform.localScale = Vector3.one * 1.3f;
 
             float elapsed = 0f;
-            float duration = 0.45f;
-
+            const float duration = 0.4f;
             while (elapsed < duration)
             {
-                elapsed += Time.deltaTime;
-                float t = elapsed / duration;
-                feedbackText.transform.localScale = Vector3.Lerp(Vector3.one * 1.3f, Vector3.one, t);
+                elapsed += Time.unscaledDeltaTime;
+                feedbackText.transform.localScale = Vector3.Lerp(Vector3.one * 1.35f, Vector3.one, elapsed / duration);
                 yield return null;
             }
 
             feedbackText.transform.localScale = Vector3.one;
-            yield return new WaitForSeconds(0.2f);
+            yield return new WaitForSecondsRealtime(0.25f);
             feedbackText.text = "";
+            feedbackRoutine = null;
         }
 
         private void UpdateComboUI()
         {
             if (comboText == null) return;
-
-            if (currentCombo > 1)
-            {
-                comboText.text = $"<size=70%>COMBO</size>\n<color=#00FFFF><b>{currentCombo}</b></color>";
-            }
-            else
-            {
-                comboText.text = "";
-            }
+            comboText.text = currentCombo > 1 ? $"COMBO x{currentCombo}" : "";
         }
 
-        /// <summary>
-        /// Anima el anillo visual o metrónomo pulsando al ritmo del compás musical.
-        /// </summary>
         private void AnimatePulseRing(float progress)
         {
             if (pulseRing == null) return;
 
-            // Escala de contracción hacia el pulso central (1.0 -> 0.0)
-            float scale = Mathf.Lerp(1.25f, 1.0f, progress);
+            // El anillo se cierra sobre el botón justo al llegar el tiempo
+            float scale = Mathf.Lerp(1.45f, 1f, progress);
             pulseRing.localScale = new Vector3(scale, scale, 1f);
         }
     }

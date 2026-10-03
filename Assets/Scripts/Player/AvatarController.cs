@@ -1,272 +1,204 @@
 using System;
-using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.EventSystems;
 using ConcertDefense.Core;
 using ConcertDefense.Towers;
 
 namespace ConcertDefense.Player
 {
     /// <summary>
-    /// Controlador de la heroína principal (avatar del jugador):
-    /// - Se desplaza hacia el punto tocado en el campo holográfico usando MoveTowards (sin NavMesh).
-    /// - Soporta teletransporte instantáneo entre TeleportPads con destello cian.
-    /// - Afina y reactiva automáticamente torres silenciadas cuando se aproxima a ellas (mecánica del Jefe Feedback).
+    /// Heroína del jugador (GDD 4.2):
+    /// - Camina hacia el punto tocado del campo con MoveTowards (sin NavMesh), en coordenadas locales del campo.
+    /// - Se teletransporta entre TeleportPads con destello cian.
+    /// - Afina las torres silenciadas por el jefe Feedback al acercarse.
     /// </summary>
-    [RequireComponent(typeof(Collider))]
     public class AvatarController : MonoBehaviour
     {
         public static AvatarController Instance { get; private set; }
 
-        [Header("Parámetros de Movimiento (GDD 4.2)")]
-        [Tooltip("Velocidad de caminata del avatar.")]
-        [SerializeField] private float moveSpeed = 1.6f;
+        [Header("Movimiento (GDD 4.2)")]
+        [Tooltip("Velocidad de caminata en unidades de campo por segundo.")]
+        [SerializeField] private float moveSpeed = 0.6f;
 
-        [Tooltip("Velocidad de rotación al orientarse hacia el destino.")]
+        [Tooltip("Velocidad de giro hacia el destino.")]
         [SerializeField] private float rotationSpeed = 14f;
 
-        [Tooltip("Distancia de parada respecto al punto objetivo.")]
-        [SerializeField] private float stoppingDistance = 0.05f;
+        [Tooltip("Mitad del lado del campo: la heroína no sale de este cuadrado.")]
+        [SerializeField] private float fieldHalfSize = 0.78f;
 
-        [Header("Detección de Toques")]
-        [Tooltip("Etiqueta que identifica el plano o suelo del campo de batalla.")]
-        [SerializeField] private string fieldTag = "Field";
-
-        [Header("Animación y Efectos")]
-        [Tooltip("Componente Animator opcional para transiciones de Idle y Walk.")]
-        [SerializeField] private Animator animator;
-
-        [Tooltip("Nombre del parámetro booleano en el Animator que indica si camina.")]
-        [SerializeField] private string movingAnimParam = "IsMoving";
-
-        [Tooltip("Prefab de partículas instanciado en el punto de destino al tocar el suelo.")]
-        [SerializeField] private GameObject moveIndicatorPrefab;
-
-        [Tooltip("Prefab de partículas con destello cian para el teletransporte.")]
+        [Header("Efectos")]
+        [Tooltip("Destello cian del teletransporte.")]
         [SerializeField] private GameObject teleportVfxPrefab;
 
-        [Header("Afinación de Torres (Jefe Feedback)")]
-        [Tooltip("Distancia a la que el avatar afina automáticamente una torre silenciada.")]
-        [SerializeField] private float tuneProximity = 1.0f;
+        [Tooltip("Marca visual en el punto de destino.")]
+        [SerializeField] private GameObject moveIndicatorPrefab;
 
-        // Variables de estado
-        private Vector3 targetPosition;
-        private bool isMoving = false;
-        private Camera mainCamera;
+        [Tooltip("Parte visual que se balancea al caminar.")]
+        [SerializeField] private Transform visualRoot;
+
+        [Header("Afinación de Torres (Jefe Feedback)")]
+        [Tooltip("Distancia a la que afina una torre silenciada, en unidades de campo.")]
+        [SerializeField] private float tuneProximity = 0.35f;
+
+        private Vector3 targetLocalPosition;
+        private bool isMoving;
+        private float baseLocalY;
+        private float tuneCheckTimer;
 
         public bool IsMoving => isMoving;
-        public Vector3 CurrentDestination => targetPosition;
 
-        // Eventos
         public event Action<Vector3> OnDestinationSet;
         public event Action OnArrivedAtDestination;
         public event Action<Vector3> OnTeleported;
 
         private void Awake()
         {
-            if (Instance != null && Instance != this)
-            {
-                Destroy(gameObject);
-                return;
-            }
             Instance = this;
-
-            targetPosition = transform.position;
-            mainCamera = Camera.main;
+            targetLocalPosition = transform.localPosition;
+            baseLocalY = transform.localPosition.y;
         }
 
-        private void Start()
+        private void OnDestroy()
         {
-            // Comprobación periódica de afinación de torres cercanas
-            InvokeRepeating(nameof(CheckForSilencedTowersNearby), 0.5f, 0.3f);
+            if (Instance == this) Instance = null;
         }
 
         private void Update()
         {
-            // Solo procesar movimiento durante el estado de juego activo
-            if (GameManager.Instance != null && GameManager.Instance.CurrentState != GameState.Playing)
-            {
-                return;
-            }
+            if (GameManager.Instance != null && !GameManager.Instance.IsPlaying) return;
 
-            // 1. Detectar toque en el suelo del campo para fijar destino
-            HandleInput();
-
-            // 2. Desplazar avatar hacia el destino mediante MoveTowards
             MoveTowardsTarget();
-        }
+            AnimateWalk();
 
-        /// <summary>
-        /// Detecta clics o toques sobre la superficie del campo para mover a la heroína.
-        /// </summary>
-        private void HandleInput()
-        {
-            if (TryGetScreenTouch(out Vector2 screenPos))
+            tuneCheckTimer -= Time.deltaTime;
+            if (tuneCheckTimer <= 0f)
             {
-                if (IsPointerOverUI(screenPos)) return;
-
-                if (mainCamera == null) mainCamera = Camera.main;
-                if (mainCamera == null) return;
-
-                Ray ray = mainCamera.ScreenPointToRay(screenPos);
-                if (Physics.Raycast(ray, out RaycastHit hit))
-                {
-                    // Si tocamos el suelo del campo (Battlefield o Field)
-                    if (hit.collider.CompareTag(fieldTag))
-                    {
-                        SetDestination(hit.point);
-                    }
-                }
+                tuneCheckTimer = 0.25f;
+                TuneNearbyTowers();
             }
         }
 
         /// <summary>
-        /// Asigna una nueva posición objetivo y actualiza orientación y animaciones.
+        /// Fija el destino a partir de un punto del mundo tocado sobre el campo.
         /// </summary>
-        public void SetDestination(Vector3 destination)
+        public void SetDestination(Vector3 worldPoint)
         {
-            // Mantener la misma altura Y que el avatar para no hundirse en el suelo
-            destination.y = transform.position.y;
-            targetPosition = destination;
+            targetLocalPosition = ToClampedLocal(worldPoint);
             isMoving = true;
 
-            // Instanciar indicador visual en el punto tocado
-            if (moveIndicatorPrefab != null)
-            {
-                Instantiate(moveIndicatorPrefab, targetPosition, Quaternion.identity);
-            }
-
-            UpdateAnimator(true);
-            OnDestinationSet?.Invoke(targetPosition);
+            PulseEffect.Spawn(moveIndicatorPrefab, LocalToWorld(targetLocalPosition) - Vector3.up * (baseLocalY * Battlefield.Scale * 0.9f));
+            OnDestinationSet?.Invoke(worldPoint);
         }
 
         /// <summary>
-        /// Traslada y rota a la heroína suavemente hacia el objetivo sin NavMesh.
+        /// Camina hasta quedarse a <paramref name="stopDistance"/> (unidades de campo) del punto indicado.
         /// </summary>
+        public void SetDestinationNear(Vector3 worldPoint, float stopDistance)
+        {
+            Vector3 local = ToClampedLocal(worldPoint);
+            Vector3 fromTarget = transform.localPosition - local;
+            fromTarget.y = 0f;
+
+            if (fromTarget.magnitude > stopDistance)
+            {
+                local += fromTarget.normalized * stopDistance;
+            }
+            else
+            {
+                local = transform.localPosition;
+            }
+
+            SetDestination(LocalToWorld(local));
+        }
+
         private void MoveTowardsTarget()
         {
             if (!isMoving) return;
 
-            float distance = Vector3.Distance(transform.position, targetPosition);
+            Vector3 current = transform.localPosition;
+            Vector3 toTarget = targetLocalPosition - current;
+            toTarget.y = 0f;
 
-            if (distance <= stoppingDistance)
+            if (toTarget.magnitude <= 0.01f)
             {
                 isMoving = false;
-                UpdateAnimator(false);
                 OnArrivedAtDestination?.Invoke();
                 return;
             }
 
-            // Vector de dirección horizontal
-            Vector3 direction = (targetPosition - transform.position).normalized;
-            direction.y = 0f;
+            Quaternion look = Quaternion.LookRotation(toTarget.normalized);
+            transform.localRotation = Quaternion.Slerp(transform.localRotation, look, Time.deltaTime * rotationSpeed);
+            transform.localPosition = Vector3.MoveTowards(current, targetLocalPosition, moveSpeed * Time.deltaTime);
+        }
 
-            // Rotación suave hacia la dirección de avance
-            if (direction != Vector3.zero)
-            {
-                Quaternion targetRotation = Quaternion.LookRotation(direction);
-                transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * rotationSpeed);
-            }
+        private void AnimateWalk()
+        {
+            if (visualRoot == null) return;
 
-            // Desplazamiento lineal
-            transform.position = Vector3.MoveTowards(transform.position, targetPosition, moveSpeed * Time.deltaTime);
+            // Pequeño salto al caminar y respiración suave en reposo
+            float bob = isMoving ? Mathf.Abs(Mathf.Sin(Time.time * 12f)) * 0.025f : Mathf.Sin(Time.time * 2.5f) * 0.006f;
+            visualRoot.localPosition = new Vector3(0f, bob, 0f);
         }
 
         /// <summary>
-        /// Teletransporta al avatar inmediatamente a una nueva posición (usado por TeleportPad).
+        /// Teletransporta a la heroína a un punto del mundo (lo usa TeleportPad).
         /// </summary>
-        public void Teleport(Vector3 newWorldPosition)
+        public void Teleport(Vector3 worldPoint)
         {
-            // Efecto visual en la posición de salida
-            if (teleportVfxPrefab != null)
-            {
-                Instantiate(teleportVfxPrefab, transform.position, Quaternion.identity);
-            }
+            PulseEffect.Spawn(teleportVfxPrefab, transform.position);
 
-            // Reposicionamiento instantáneo
-            newWorldPosition.y = transform.position.y;
-            transform.position = newWorldPosition;
-            targetPosition = newWorldPosition;
+            Vector3 local = ToClampedLocal(worldPoint);
+            transform.localPosition = local;
+            targetLocalPosition = local;
             isMoving = false;
-            UpdateAnimator(false);
 
-            // Efecto visual en la posición de llegada
-            if (teleportVfxPrefab != null)
-            {
-                Instantiate(teleportVfxPrefab, transform.position, Quaternion.identity);
-            }
-
-            OnTeleported?.Invoke(newWorldPosition);
-            Debug.Log($"[AvatarController] Heroína teletransportada a {newWorldPosition}.");
+            PulseEffect.Spawn(teleportVfxPrefab, transform.position);
+            Sfx.Play(SfxId.Teleport);
+            OnTeleported?.Invoke(transform.position);
         }
 
         /// <summary>
-        /// Revisa si hay torres silenciadas cercanas y las afina automáticamente (mecánica Feedback).
+        /// Afina las torres silenciadas cercanas (mecánica del jefe Feedback).
         /// </summary>
-        private void CheckForSilencedTowersNearby()
+        private void TuneNearbyTowers()
         {
-            Collider[] colliders = Physics.OverlapSphere(transform.position, tuneProximity);
-            foreach (var col in colliders)
+            float worldRadius = tuneProximity * Battlefield.Scale;
+
+            for (int i = 0; i < Tower.All.Count; i++)
             {
-                if (col.CompareTag("Tower"))
-                {
-                    Tower tower = col.GetComponent<Tower>();
-                    if (tower != null && tower.IsSilenced)
-                    {
-                        tower.Tune();
-                    }
-                }
+                Tower tower = Tower.All[i];
+                if (!tower.IsSilenced) continue;
+
+                Vector3 delta = tower.transform.position - transform.position;
+                delta.y = 0f;
+                if (delta.magnitude > worldRadius) continue;
+
+                tower.Tune();
+                PulseEffect.Spawn(teleportVfxPrefab, tower.transform.position, 0.7f);
+                Sfx.Play(SfxId.Good);
+                GameMessages.Show($"¡Torre {tower.TowerName} afinada!", 1.5f);
             }
         }
 
-        private void UpdateAnimator(bool moving)
+        private Vector3 ToClampedLocal(Vector3 worldPoint)
         {
-            if (animator != null && !string.IsNullOrEmpty(movingAnimParam))
-            {
-                animator.SetBool(movingAnimParam, moving);
-            }
+            Transform parent = transform.parent;
+            Vector3 local = parent != null ? parent.InverseTransformPoint(worldPoint) : worldPoint;
+            local.x = Mathf.Clamp(local.x, -fieldHalfSize, fieldHalfSize);
+            local.z = Mathf.Clamp(local.z, -fieldHalfSize, fieldHalfSize);
+            local.y = baseLocalY;
+            return local;
         }
 
-        private bool TryGetScreenTouch(out Vector2 screenPosition)
+        private Vector3 LocalToWorld(Vector3 local)
         {
-            if (Input.touchCount > 0)
-            {
-                Touch t = Input.GetTouch(0);
-                if (t.phase == TouchPhase.Began)
-                {
-                    screenPosition = t.position;
-                    return true;
-                }
-            }
-
-            if (Input.GetMouseButtonDown(0))
-            {
-                screenPosition = Input.mousePosition;
-                return true;
-            }
-
-            screenPosition = default;
-            return false;
-        }
-
-        private bool IsPointerOverUI(Vector2 screenPosition)
-        {
-            if (EventSystem.current == null) return false;
-
-            PointerEventData eventData = new PointerEventData(EventSystem.current)
-            {
-                position = screenPosition
-            };
-
-            List<RaycastResult> results = new List<RaycastResult>();
-            EventSystem.current.RaycastAll(eventData, results);
-            return results.Count > 0;
+            Transform parent = transform.parent;
+            return parent != null ? parent.TransformPoint(local) : local;
         }
 
         private void OnDrawGizmosSelected()
         {
             Gizmos.color = Color.magenta;
-            Gizmos.DrawWireSphere(transform.position, tuneProximity);
+            Gizmos.DrawWireSphere(transform.position, tuneProximity * transform.lossyScale.x);
         }
     }
 }

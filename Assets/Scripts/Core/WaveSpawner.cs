@@ -3,7 +3,6 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using ConcertDefense.Enemies;
-using ConcertDefense.AR;
 
 namespace ConcertDefense.Core
 {
@@ -32,53 +31,41 @@ namespace ConcertDefense.Core
     [Serializable]
     public class WaveData
     {
-        [Tooltip("Nombre de la oleada (ej: Oleada 1 - Introducción al Ruido).")]
+        [Tooltip("Nombre de la oleada.")]
         public string waveTitle;
 
         [Tooltip("Grupos de enemigos normales que aparecerán en orden.")]
         public List<EnemyGroup> enemyGroups = new List<EnemyGroup>();
 
-        [Tooltip("Prefab del Jefe de la oleada (opcional en oleadas sin jefe).")]
+        [Tooltip("Prefab del Jefe de la oleada.")]
         public GameObject bossPrefab;
 
         [Tooltip("Pausa en segundos tras el último glitch común antes de la llegada del jefe.")]
-        public float delayBeforeBoss = 3f;
+        public float delayBeforeBoss = 4f;
     }
 
     /// <summary>
-    /// Controlador responsable del flujo, temporización y generación de oleadas de enemigos.
+    /// Controla el flujo de oleadas (GDD 6): crea enemigos y jefe, y cierra la oleada
+    /// cuando el jefe y todos los glitches han salido del campo.
     /// </summary>
     public class WaveSpawner : MonoBehaviour
     {
         public static WaveSpawner Instance { get; private set; }
 
-        [Header("Configuración de Oleadas (GDD)")]
-        [Tooltip("Lista secuencial de oleadas definidas para la partida.")]
+        [Header("Configuración de Oleadas (GDD 6)")]
         [SerializeField] private List<WaveData> waves = new List<WaveData>();
 
-        [Header("Referencias de Ruta y Contenedor")]
-        [Tooltip("Transform padre que contiene los waypoints ordenados como hijos.")]
-        [SerializeField] private Transform pathContainer;
+        public bool IsWaveInProgress { get; private set; }
+        public int CurrentWaveIndex { get; private set; } // 0-indexed
+        public int TotalWaves => waves.Count;
+        public int ActiveEnemies => activeEnemies;
 
-        [Tooltip("Lista manual de waypoints (si no se usa un contenedor padre).")]
-        [SerializeField] private Transform[] waypoints;
+        private int activeEnemies;
+        private Transform[] waypoints;
 
-        [Tooltip("Contenedor donde se agruparán los enemigos instanciados en la jerarquía.")]
-        [SerializeField] private Transform enemiesContainer;
-
-        // Variables de estado
-        public bool IsWaveInProgress { get; private set; } = false;
-        public int CurrentWaveIndex { get; private set; } = 0; // 0-indexed
-        public int TotalWaves => waves.Count > 0 ? waves.Count : 4;
-
-        private int activeEnemiesCount = 0;
-        private Coroutine waveCoroutine;
-        private FieldManipulator fieldManipulator;
-
-        // Eventos
         public event Action<int> OnWaveStarted;             // (número de oleada 1-based)
         public event Action<int> OnWaveCompleted;           // (número de oleada superada)
-        public event Action<int> OnRemainingEnemiesChanged; // (enemigos restantes en combate)
+        public event Action<int> OnRemainingEnemiesChanged; // (enemigos en el campo)
 
         private void Awake()
         {
@@ -88,218 +75,121 @@ namespace ConcertDefense.Core
                 return;
             }
             Instance = this;
-
-            fieldManipulator = FindFirstObjectByType<FieldManipulator>();
         }
 
-        private void Start()
+        private void OnDestroy()
         {
-            ExtractWaypoints();
+            if (Instance == this) Instance = null;
         }
 
         /// <summary>
-        /// Asigna y extrae los waypoints desde el objeto Battlefield recién colocado.
+        /// Inicia la siguiente oleada. Lo llama el botón "Iniciar oleada" del HUD.
+        /// Devuelve false si todavía no se puede (campo sin colocar, oleada en curso...).
         /// </summary>
-        public void SetupPathAndContainers(Transform pathParent, Transform enemiesParent)
+        public bool StartNextWave()
         {
-            pathContainer = pathParent;
-            enemiesContainer = enemiesParent;
-            ExtractWaypoints();
+            if (IsWaveInProgress) return false;
+            if (GameManager.Instance == null || !GameManager.Instance.IsPlaying) return false;
+            if (CurrentWaveIndex >= waves.Count) return false;
+
+            Battlefield field = Battlefield.Instance;
+            if (field == null || !field.gameObject.activeInHierarchy) return false;
+
+            waypoints = field.GetPathWaypoints();
+            if (waypoints.Length < 2)
+            {
+                Debug.LogError("[WaveSpawner] El Battlefield no tiene waypoints en 'Path'.");
+                return false;
+            }
+
+            StartCoroutine(WaveRoutine(CurrentWaveIndex));
+            return true;
         }
 
-        /// <summary>
-        /// Extrae automáticamente los hijos del contenedor Path como waypoints ordenados.
-        /// </summary>
-        private void ExtractWaypoints()
-        {
-            if (pathContainer == null)
-            {
-                GameObject foundPath = GameObject.Find("Path");
-                if (foundPath != null) pathContainer = foundPath.transform;
-            }
-
-            if (enemiesContainer == null)
-            {
-                GameObject foundEnemies = GameObject.Find("EnemiesContainer");
-                if (foundEnemies != null) enemiesContainer = foundEnemies.transform;
-            }
-
-            if (pathContainer != null && pathContainer.childCount > 0)
-            {
-                waypoints = new Transform[pathContainer.childCount];
-                for (int i = 0; i < pathContainer.childCount; i++)
-                {
-                    waypoints[i] = pathContainer.GetChild(i);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Inicia la siguiente oleada. Llamado típicamente desde el botón 'Iniciar Oleada' de la UI.
-        /// </summary>
-        public void StartNextWave()
-        {
-            if (IsWaveInProgress)
-            {
-                Debug.LogWarning("[WaveSpawner] Ya hay una oleada en combate.");
-                return;
-            }
-
-            if (GameManager.Instance != null && GameManager.Instance.CurrentState != GameState.Playing)
-            {
-                // Si el escenario ya está presente en la escena, pasar a Playing
-                var placer = FindFirstObjectByType<ARPlacementController>();
-                bool isBattlefieldPresent = (placer != null && placer.IsPlaced) ||
-                                            GameObject.Find("Battlefield") != null ||
-                                            GameObject.Find("Battlefield(Clone)") != null ||
-                                            GameObject.Find("Path") != null ||
-                                            (waypoints != null && waypoints.Length > 0);
-
-                if (isBattlefieldPresent)
-                {
-                    GameManager.Instance.ChangeState(GameState.Playing);
-                }
-                else
-                {
-                    Debug.LogWarning("[WaveSpawner] No se puede iniciar oleada sin haber colocado el escenario. Pulsa Espacio para colocarlo.");
-                    return;
-                }
-            }
-
-            if (CurrentWaveIndex >= TotalWaves)
-            {
-                Debug.Log("[WaveSpawner] ¡Todas las oleadas han sido completadas!");
-                GameManager.Instance?.ChangeState(GameState.Victory);
-                return;
-            }
-
-            // Si los waypoints aún no estaban cacheados, intentar extraerlos
-            if (waypoints == null || waypoints.Length == 0)
-            {
-                ExtractWaypoints();
-            }
-
-            if (waypoints == null || waypoints.Length == 0)
-            {
-                Debug.LogError("[WaveSpawner] No hay waypoints configurados para la ruta de los enemigos.");
-                return;
-            }
-
-            Debug.Log($"<color=#00FF88><b>[WaveSpawner] ¡Iniciando Oleada {CurrentWaveIndex + 1}/{TotalWaves}!</b></color>");
-            waveCoroutine = StartCoroutine(SpawnWaveRoutine(CurrentWaveIndex));
-        }
-
-        /// <summary>
-        /// Corrutina que gestiona la aparición secuencial de los enemigos de la oleada actual.
-        /// </summary>
-        private IEnumerator SpawnWaveRoutine(int waveIndex)
+        private IEnumerator WaveRoutine(int waveIndex)
         {
             IsWaveInProgress = true;
-            activeEnemiesCount = 0;
+            activeEnemies = 0;
 
-            // Bloquear manipulación del campo durante el combate para no desorientar el juego
-            if (fieldManipulator != null)
+            int waveNumber = waveIndex + 1;
+            WaveData wave = waves[waveIndex];
+
+            GameManager.Instance.SetWave(waveNumber);
+            OnWaveStarted?.Invoke(waveNumber);
+            Debug.Log($"[WaveSpawner] Oleada {waveNumber}/{waves.Count}: {wave.waveTitle}");
+
+            // 1. Glitches normales, grupo a grupo
+            foreach (EnemyGroup group in wave.enemyGroups)
             {
-                fieldManipulator.ManipulationAllowed = false;
-            }
-
-            int waveDisplayNumber = waveIndex + 1;
-            GameManager.Instance?.SetWave(waveDisplayNumber);
-            OnWaveStarted?.Invoke(waveDisplayNumber);
-
-            WaveData currentWave = waveIndex < waves.Count ? waves[waveIndex] : null;
-
-            if (currentWave != null)
-            {
-                // 1. Instanciar grupos de enemigos normales
-                foreach (var group in currentWave.enemyGroups)
+                for (int i = 0; i < group.count; i++)
                 {
-                    for (int i = 0; i < group.count; i++)
-                    {
-                        SpawnEnemy(group.enemyPrefab);
-                        yield return new WaitForSeconds(group.spawnInterval);
-                    }
-                }
-
-                // 2. Si hay un jefe definido, pausar brevemente y luego instanciarlo
-                if (currentWave.bossPrefab != null)
-                {
-                    yield return new WaitForSeconds(currentWave.delayBeforeBoss);
-                    SpawnEnemy(currentWave.bossPrefab);
+                    if (!GameManager.Instance.IsPlaying) yield break;
+                    SpawnEnemy(group.enemyPrefab);
+                    yield return new WaitForSeconds(Mathf.Max(0.1f, group.spawnInterval));
                 }
             }
-            else
+
+            // 2. Jefe de la oleada
+            if (wave.bossPrefab != null)
             {
-                Debug.LogWarning($"[WaveSpawner] No hay configuración de datos para la oleada {waveDisplayNumber}.");
+                yield return new WaitForSeconds(wave.delayBeforeBoss);
+                if (!GameManager.Instance.IsPlaying) yield break;
+                SpawnEnemy(wave.bossPrefab);
             }
 
-            // 3. Esperar hasta que todos los enemigos y el jefe sean derrotados o alcancen la meta
-            while (activeEnemiesCount > 0)
+            // 3. Esperar a que el jefe y el resto de glitches salgan del campo
+            while (activeEnemies > 0)
             {
-                yield return new WaitForSeconds(0.5f);
+                yield return null;
             }
 
-            // 4. Oleada completada con éxito
+            if (!GameManager.Instance.IsPlaying) yield break;
+
+            // 4. Oleada superada: pausa para construir
             IsWaveInProgress = false;
-            OnWaveCompleted?.Invoke(waveDisplayNumber);
-
-            // Reactivar manipulación y descanso para construir
-            if (fieldManipulator != null)
-            {
-                fieldManipulator.ManipulationAllowed = true;
-            }
-
             CurrentWaveIndex++;
+            OnWaveCompleted?.Invoke(waveNumber);
 
-            if (CurrentWaveIndex >= TotalWaves)
+            if (CurrentWaveIndex >= waves.Count)
             {
-                GameManager.Instance?.ChangeState(GameState.Victory);
-            }
-            else
-            {
-                Debug.Log($"[WaveSpawner] Oleada {waveDisplayNumber} superada. Pausa activa para construir torres.");
+                GameManager.Instance.ChangeState(GameState.Victory);
             }
         }
 
-        /// <summary>
-        /// Instancia un enemigo individual en el primer waypoint y se suscribe a sus eventos de vida.
-        /// </summary>
         private void SpawnEnemy(GameObject prefab)
         {
-            if (prefab == null) return;
+            if (prefab == null || Battlefield.Instance == null) return;
 
-            Vector3 spawnPos = waypoints.Length > 0 ? waypoints[0].position : transform.position;
-            Quaternion spawnRot = waypoints.Length > 0 ? waypoints[0].rotation : Quaternion.identity;
-
-            Transform parent = enemiesContainer != null ? enemiesContainer : transform;
-            GameObject enemyObj = Instantiate(prefab, spawnPos, spawnRot, parent);
-
-            Enemy enemy = enemyObj.GetComponent<Enemy>();
-            if (enemy != null)
+            GameObject obj = Instantiate(prefab, Battlefield.Instance.Enemies);
+            Enemy enemy = obj.GetComponent<Enemy>();
+            if (enemy == null)
             {
-                enemy.InitializePath(waypoints);
-                activeEnemiesCount++;
-                OnRemainingEnemiesChanged?.Invoke(activeEnemiesCount);
-
-                // Suscripción a eventos de ciclo de vida
-                enemy.OnEnemyDeath += HandleEnemyFinished;
-                enemy.OnEnemyReachedEnd += HandleEnemyFinished;
+                Debug.LogError($"[WaveSpawner] El prefab {prefab.name} no tiene componente Enemy.");
+                Destroy(obj);
+                return;
             }
+
+            enemy.InitializePath(waypoints, 0, null);
+            RegisterEnemy(enemy);
         }
 
         /// <summary>
-        /// Decrementa el contador de enemigos activos al morir o alcanzar la meta.
+        /// Cuenta a un enemigo como parte de la oleada (también los esbirros que crean los jefes).
         /// </summary>
-        private void HandleEnemyFinished(Enemy enemy)
+        public void RegisterEnemy(Enemy enemy)
         {
-            if (enemy != null)
-            {
-                enemy.OnEnemyDeath -= HandleEnemyFinished;
-                enemy.OnEnemyReachedEnd -= HandleEnemyFinished;
-            }
+            if (enemy == null) return;
 
-            activeEnemiesCount = Mathf.Max(0, activeEnemiesCount - 1);
-            OnRemainingEnemiesChanged?.Invoke(activeEnemiesCount);
+            activeEnemies++;
+            enemy.OnRemoved += HandleEnemyRemoved;
+            OnRemainingEnemiesChanged?.Invoke(activeEnemies);
+        }
+
+        private void HandleEnemyRemoved(Enemy enemy)
+        {
+            enemy.OnRemoved -= HandleEnemyRemoved;
+            activeEnemies = Mathf.Max(0, activeEnemies - 1);
+            OnRemainingEnemiesChanged?.Invoke(activeEnemies);
         }
     }
 }

@@ -1,44 +1,36 @@
 using System.Collections.Generic;
 using UnityEngine;
-using UnityEngine.EventSystems;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
 using ConcertDefense.Core;
+using ConcertDefense.Player;
+using ConcertDefense.Towers;
 
 namespace ConcertDefense.AR
 {
     /// <summary>
-    /// Gestiona la manipulación táctil del campo de batalla en AR:
-    /// - Pellizco con dos dedos: escalar entre 0.5x y 2x.
-    /// - Giro con dos dedos: rotar sobre el eje Y.
-    /// - Arrastre con un dedo en área libre: reposicionar sobre la superficie AR.
-    /// Solo se permite manipular cuando no hay una oleada activa para no interferir con el combate.
+    /// Manipulación táctil del campo (GDD 4.7):
+    /// - Pellizco: escalar entre 0.5× y 2×.
+    /// - Giro con dos dedos: rotar en Y.
+    /// - Arrastre con un dedo sobre una zona libre: mover el campo.
+    /// Solo con la oleada detenida, para no confundirlo con los toques de combate.
     /// </summary>
     public class FieldManipulator : MonoBehaviour
     {
         [Header("Referencias")]
-        [Tooltip("Controlador de colocación para obtener la referencia del Battlefield instanciado.")]
-        [SerializeField] private ARPlacementController placementController;
-
-        [Tooltip("Gestor de raycasts de AR Foundation para proyectar el arrastre sobre planos.")]
+        [Tooltip("Para proyectar el arrastre sobre los planos detectados.")]
         [SerializeField] private ARRaycastManager raycastManager;
 
-        [Header("Límites de Escala")]
-        [Tooltip("Multiplicador de escala mínima (0.5x según GDD).")]
+        [Header("Límites de Escala (GDD 4.7)")]
         [SerializeField] private float minScaleMultiplier = 0.5f;
-
-        [Tooltip("Multiplicador de escala máxima (2.0x según GDD).")]
-        [SerializeField] private float maxScaleMultiplier = 2.0f;
+        [SerializeField] private float maxScaleMultiplier = 2f;
 
         [Header("Sensibilidad")]
-        [Tooltip("Sensibilidad del gesto de pellizco.")]
-        [SerializeField] private float pinchSensitivity = 0.003f;
-
-        [Tooltip("Sensibilidad de rotación con dos dedos.")]
-        [SerializeField] private float rotationSensitivity = 0.4f;
+        [Tooltip("Píxeles que debe moverse el dedo para que el toque cuente como arrastre.")]
+        [SerializeField] private float dragThresholdPixels = 28f;
 
         [Header("Control de Estado")]
-        [Tooltip("Permite habilitar o deshabilitar la manipulación según si hay una oleada en curso.")]
+        [Tooltip("Interruptor general de la manipulación.")]
         [SerializeField] private bool manipulationAllowed = true;
 
         public bool ManipulationAllowed
@@ -47,207 +39,203 @@ namespace ConcertDefense.AR
             set => manipulationAllowed = value;
         }
 
-        private Transform targetFieldTransform;
-        private Vector3 baseScale = Vector3.one;
-        private float currentScaleFactor = 1.0f;
-
-        // Variables de seguimiento de gestos
-        private float previousTouchDistance;
-        private Vector2 previousTouchVector;
-        private bool isTwoFingerGestureActive = false;
-        private bool isDraggingField = false;
-
         private static readonly List<ARRaycastHit> s_Hits = new List<ARRaycastHit>();
+        private static readonly RaycastHit[] s_PhysicsHits = new RaycastHit[16];
+
+        private Transform field;
+        private Vector3 baseScale = Vector3.one;
+        private float scaleFactor = 1f;
+
+        private bool twoFingerActive;
+        private float previousDistance;
+        private Vector2 previousVector;
+
+        private bool dragCandidate;
+        private bool dragging;
+        private Vector2 dragStartScreen;
+        private Vector3 grabOffset;
 
         private void Awake()
         {
-            if (placementController == null)
-            {
-                placementController = FindFirstObjectByType<ARPlacementController>();
-            }
-
-            if (raycastManager == null)
-            {
-                raycastManager = GetComponent<ARRaycastManager>();
-                if (raycastManager == null)
-                {
-                    raycastManager = FindFirstObjectByType<ARRaycastManager>();
-                }
-            }
+            if (raycastManager == null) raycastManager = GetComponent<ARRaycastManager>();
         }
 
         private void Update()
         {
-            // Solo actuar si el juego está en estado Playing y se permite manipular
-            if (!manipulationAllowed || GameManager.Instance == null || GameManager.Instance.CurrentState != GameState.Playing)
+            if (!CanManipulate())
             {
+                twoFingerActive = false;
+                dragCandidate = false;
+                dragging = false;
                 return;
             }
 
-            // Obtener el transform del campo si aún no lo tenemos
-            if (targetFieldTransform == null)
+            // Si el campo cambió (primera colocación), se toma su escala como 1×
+            Transform current = Battlefield.Instance.transform;
+            if (current != field)
             {
-                if (placementController != null && placementController.SpawnedBattlefield != null)
-                {
-                    targetFieldTransform = placementController.SpawnedBattlefield.transform;
-                    baseScale = targetFieldTransform.localScale;
-                }
-                else
-                {
-                    return;
-                }
+                field = current;
+                baseScale = field.localScale;
+                scaleFactor = 1f;
             }
 
-            // 1. Manejo táctil con dos dedos (Escala + Rotación)
-            if (Input.touchCount == 2)
+            if (PointerInput.PressedCount >= 2)
             {
-                HandleTwoFingerGestures();
+                dragCandidate = false;
+                dragging = false;
+                HandleTwoFingers();
                 return;
             }
-            else
-            {
-                isTwoFingerGestureActive = false;
-            }
 
-            // 2. Manejo táctil con un dedo (Arrastre sobre superficie AR)
-            if (Input.touchCount == 1)
-            {
-                HandleOneFingerDrag();
-                return;
-            }
-            else
-            {
-                isDraggingField = false;
-            }
-
-            // 3. Simulación para pruebas rápidas dentro del Editor de Unity
-            #if UNITY_EDITOR
-            HandleEditorSimulation();
-            #endif
+            twoFingerActive = false;
+            HandleOneFingerDrag();
+            HandleEditorMouse();
         }
 
-        /// <summary>
-        /// Procesa simultáneamente el pellizco para escalar y el giro angular para rotar en Y.
-        /// </summary>
-        private void HandleTwoFingerGestures()
+        private bool CanManipulate()
         {
-            Touch touch0 = Input.GetTouch(0);
-            Touch touch1 = Input.GetTouch(1);
-
-            // Ignorar si alguno de los dedos interactúa sobre un botón de la UI
-            if (IsPointerOverUI(touch0.position) || IsPointerOverUI(touch1.position))
-            {
-                return;
-            }
-
-            Vector2 currentTouchVector = touch1.position - touch0.position;
-            float currentDistance = currentTouchVector.magnitude;
-
-            if (!isTwoFingerGestureActive)
-            {
-                previousTouchDistance = currentDistance;
-                previousTouchVector = currentTouchVector;
-                isTwoFingerGestureActive = true;
-                return;
-            }
-
-            // --- Escala (Pellizco) ---
-            float distanceDelta = currentDistance - previousTouchDistance;
-            currentScaleFactor += distanceDelta * pinchSensitivity;
-            currentScaleFactor = Mathf.Clamp(currentScaleFactor, minScaleMultiplier, maxScaleMultiplier);
-            targetFieldTransform.localScale = baseScale * currentScaleFactor;
-
-            // --- Rotación (Giro de dos dedos) ---
-            float angleDelta = Vector2.SignedAngle(previousTouchVector, currentTouchVector);
-            targetFieldTransform.Rotate(Vector3.up, -angleDelta * rotationSensitivity, Space.World);
-
-            previousTouchDistance = currentDistance;
-            previousTouchVector = currentTouchVector;
+            if (!manipulationAllowed) return false;
+            if (GameManager.Instance == null || !GameManager.Instance.IsPlaying) return false;
+            if (Battlefield.Instance == null) return false;
+            if (WaveSpawner.Instance != null && WaveSpawner.Instance.IsWaveInProgress) return false;
+            return true;
         }
 
         /// <summary>
-        /// Permite arrastrar el campo sobre planos detectados tocando una zona libre.
+        /// Pellizco para escalar y giro para rotar en Y, a la vez.
+        /// </summary>
+        private void HandleTwoFingers()
+        {
+            if (!PointerInput.TryGetPressedTouch(0, out Vector2 p0) || !PointerInput.TryGetPressedTouch(1, out Vector2 p1)) return;
+            if (PointerInput.IsOverUI(p0) || PointerInput.IsOverUI(p1)) return;
+
+            Vector2 vector = p1 - p0;
+            float distance = vector.magnitude;
+
+            if (!twoFingerActive)
+            {
+                twoFingerActive = true;
+                previousDistance = distance;
+                previousVector = vector;
+                return;
+            }
+
+            if (previousDistance > 1f)
+            {
+                SetScaleFactor(scaleFactor * (distance / previousDistance));
+            }
+
+            float angle = Vector2.SignedAngle(previousVector, vector);
+            field.Rotate(Vector3.up, -angle, Space.World);
+
+            previousDistance = distance;
+            previousVector = vector;
+        }
+
+        /// <summary>
+        /// Arrastre con un dedo: empieza en zona libre y solo cuenta al superar un umbral
+        /// (un toque corto sigue sirviendo para mover a la heroína).
         /// </summary>
         private void HandleOneFingerDrag()
         {
-            Touch touch = Input.GetTouch(0);
-
-            if (touch.phase == TouchPhase.Began)
+            if (PointerInput.PrimaryDown(out Vector2 downPos))
             {
-                if (IsPointerOverUI(touch.position))
-                {
-                    isDraggingField = false;
-                    return;
-                }
-
-                // Verificar si el toque no impacta directamente sobre una torre o interactuable
-                if (Physics.Raycast(Camera.main.ScreenPointToRay(touch.position), out RaycastHit hit))
-                {
-                    // Si tocamos una torre o botón de construcción, no iniciamos arrastre de campo
-                    if (hit.collider.CompareTag("Tower") || hit.collider.CompareTag("BuildSpot") || hit.collider.CompareTag("Avatar"))
-                    {
-                        isDraggingField = false;
-                        return;
-                    }
-                }
-
-                isDraggingField = true;
+                dragging = false;
+                dragStartScreen = downPos;
+                dragCandidate = !PointerInput.IsOverUI(downPos) && !HitsInteractive(downPos);
+                return;
             }
 
-            if (isDraggingField && touch.phase == TouchPhase.Moved && raycastManager != null)
+            if (!dragCandidate || !PointerInput.PrimaryHeld(out Vector2 pos))
             {
-                if (raycastManager.Raycast(touch.position, s_Hits, TrackableType.PlaneWithinPolygon))
-                {
-                    Pose hitPose = s_Hits[0].pose;
-                    targetFieldTransform.position = hitPose.position;
-                }
+                dragCandidate = false;
+                dragging = false;
+                return;
             }
 
-            if (touch.phase == TouchPhase.Ended || touch.phase == TouchPhase.Canceled)
+            if (!dragging)
             {
-                isDraggingField = false;
+                if ((pos - dragStartScreen).magnitude < dragThresholdPixels) return;
+                if (!TryGetSurfacePoint(dragStartScreen, out Vector3 grabPoint)) return;
+
+                dragging = true;
+                grabOffset = field.position - grabPoint;
+            }
+
+            if (TryGetSurfacePoint(pos, out Vector3 point))
+            {
+                field.position = point + grabOffset;
             }
         }
 
-        #if UNITY_EDITOR
         /// <summary>
-        /// Soporte de depuración en el editor de Unity mediante ratón y rueda de desplazamiento.
+        /// Pruebas en el editor: rueda del ratón para escalar y clic derecho para rotar.
         /// </summary>
-        private void HandleEditorSimulation()
+        private void HandleEditorMouse()
         {
-            // Rueda del ratón para escalar
-            float scroll = Input.GetAxis("Mouse ScrollWheel");
+            float scroll = PointerInput.ScrollDelta;
             if (Mathf.Abs(scroll) > 0.01f)
             {
-                currentScaleFactor += scroll * 2f;
-                currentScaleFactor = Mathf.Clamp(currentScaleFactor, minScaleMultiplier, maxScaleMultiplier);
-                targetFieldTransform.localScale = baseScale * currentScaleFactor;
+                SetScaleFactor(scaleFactor * (1f + Mathf.Sign(scroll) * 0.08f));
             }
 
-            // Clic derecho sostenido para rotar en Y
-            if (Input.GetMouseButton(1))
+            if (PointerInput.SecondaryHeld)
             {
-                float mouseX = Input.GetAxis("Mouse X");
-                targetFieldTransform.Rotate(Vector3.up, -mouseX * 5f, Space.World);
+                field.Rotate(Vector3.up, -PointerInput.MouseDelta.x * 0.4f, Space.World);
             }
         }
-        #endif
+
+        private void SetScaleFactor(float factor)
+        {
+            scaleFactor = Mathf.Clamp(factor, minScaleMultiplier, maxScaleMultiplier);
+            field.localScale = baseScale * scaleFactor;
+        }
 
         /// <summary>
-        /// Comprueba si la posición en pantalla coincide con un elemento de UI.
+        /// ¿El toque cae sobre una torre, plataforma, pad o la heroína? Entonces no es arrastre de campo.
         /// </summary>
-        private bool IsPointerOverUI(Vector2 screenPosition)
+        private static bool HitsInteractive(Vector2 screenPosition)
         {
-            if (EventSystem.current == null) return false;
+            Camera cam = Camera.main;
+            if (cam == null) return false;
 
-            PointerEventData eventData = new PointerEventData(EventSystem.current)
+            int count = Physics.RaycastNonAlloc(cam.ScreenPointToRay(screenPosition), s_PhysicsHits, 50f, ~0, QueryTriggerInteraction.Collide);
+            for (int i = 0; i < count; i++)
             {
-                position = screenPosition
-            };
+                Collider col = s_PhysicsHits[i].collider;
+                if (col.GetComponentInParent<Tower>() != null) return true;
+                if (col.GetComponentInParent<BuildSpot>() != null) return true;
+                if (col.GetComponentInParent<TeleportPad>() != null) return true;
+                if (col.GetComponentInParent<AvatarController>() != null) return true;
+            }
+            return false;
+        }
 
-            List<RaycastResult> results = new List<RaycastResult>();
-            EventSystem.current.RaycastAll(eventData, results);
-            return results.Count > 0;
+        /// <summary>
+        /// Punto de la superficie real bajo el dedo; si no hay plano AR, el plano horizontal a la altura del campo.
+        /// </summary>
+        private bool TryGetSurfacePoint(Vector2 screenPosition, out Vector3 point)
+        {
+            if (raycastManager != null && raycastManager.Raycast(screenPosition, s_Hits, TrackableType.PlaneWithinPolygon))
+            {
+                point = s_Hits[0].pose.position;
+                return true;
+            }
+
+            Camera cam = Camera.main;
+            if (cam != null)
+            {
+                var plane = new Plane(Vector3.up, field.position);
+                Ray ray = cam.ScreenPointToRay(screenPosition);
+                if (plane.Raycast(ray, out float enter))
+                {
+                    point = ray.GetPoint(enter);
+                    return true;
+                }
+            }
+
+            point = default;
+            return false;
         }
     }
 }

@@ -1,109 +1,133 @@
 using System;
 using UnityEngine;
 using ConcertDefense.Core;
+using ConcertDefense.Towers;
 
 namespace ConcertDefense.Enemies
 {
     public enum BossType
     {
-        Distortion,  // Oleada 1: Ralentiza proyectiles en áreas de ruido
-        Feedback,    // Oleada 2: Silencia torres
-        GlitchQueen, // Oleada 3: Se divide en glitches más pequeños
-        FinalMix     // Oleada 4: Múltiples fases combinando habilidades
+        Distortion,  // Oleada 1: zonas de ruido que ralentizan proyectiles
+        Feedback,    // Oleada 2: silencia torres
+        GlitchQueen, // Oleada 3: se divide en glitches más pequeños
+        FinalMix     // Oleada 4: varias fases combinando habilidades
     }
 
     /// <summary>
-    /// Clase base para todos los Jefes de final de oleada (GDD 5):
-    /// - Hereda de Enemy con estadísticas superiores y resta 5 puntos de Ánimo si alcanza el escenario.
-    /// - Emite eventos estáticos de aparición y derrota para vincular la barra de vida superior de la pantalla.
-    /// - Estructura base para las habilidades únicas de cada jefe.
+    /// Clase base de los jefes de final de oleada (GDD 5):
+    /// - Avisa a la UI al aparecer y al salir del campo (barra de vida superior).
+    /// - Temporizador de habilidad y utilidades comunes (zonas de ruido, silenciar torres, esbirros).
     /// </summary>
     public class BossBase : Enemy
     {
         [Header("Configuración de Jefe (GDD 5)")]
-        [Tooltip("Tipo de jefe asignado a esta oleada.")]
         [SerializeField] private BossType bossType = BossType.Distortion;
 
-        [Tooltip("Título o subtítulo del jefe para la UI superior (ej: 'Distorsión - Corruptor de Sonido').")]
+        [Tooltip("Nombre del jefe para la barra superior.")]
         [SerializeField] private string bossTitle = "Distorsión";
 
-        [Tooltip("Intervalo en segundos entre usos de la habilidad especial del jefe.")]
+        [Tooltip("Segundos entre usos de la habilidad especial.")]
         [SerializeField] protected float abilityInterval = 6f;
 
-        [Header("Barra de Vida Flotante (World Space)")]
-        [Tooltip("Prefab opcional de barra de vida flotante específico para el jefe.")]
-        [SerializeField] private GameObject worldSpaceHealthBarPrefab;
+        [Tooltip("Efecto visual al usar la habilidad.")]
+        [SerializeField] protected GameObject abilityVfxPrefab;
 
-        protected float abilityTimer = 0f;
+        protected float abilityTimer;
 
         public BossType Type => bossType;
         public string BossTitle => bossTitle;
 
-        // Eventos estáticos globales para la UI de pantalla y el WaveSpawner
         public static event Action<BossBase> OnBossSpawned;
+        /// <summary>El jefe salió del campo: derrotado o porque llegó al escenario.</summary>
         public static event Action<BossBase> OnBossDefeated;
-
-        protected override void Awake()
-        {
-            base.Awake();
-            // Según GDD 4.6: "cada jefe que llega resta 5 puntos de Ánimo"
-            stageDamage = 5;
-        }
 
         protected override void Start()
         {
             base.Start();
 
-            // Instanciar barra de vida flotante sobre el jefe si está asignada
-            if (worldSpaceHealthBarPrefab != null)
-            {
-                GameObject bar = Instantiate(worldSpaceHealthBarPrefab, transform.position, Quaternion.identity);
-                var follow = bar.GetComponent<ConcertDefense.UI.UIFollow>();
-                if (follow != null)
-                {
-                    follow.SetTarget(transform, new Vector3(0f, 0.6f, 0f));
-                }
-            }
-
             abilityTimer = abilityInterval;
-
-            // Notificar a la UI superior que el jefe ha entrado al campo
             OnBossSpawned?.Invoke(this);
-            Debug.Log($"[BossBase] ¡El Jefe {bossTitle} ha aparecido en el escenario!");
+            Sfx.Play(SfxId.BossArrive);
+            GameMessages.Show($"¡Llega el jefe {bossTitle}!", 3f);
         }
 
-        protected virtual void Update()
+        protected override void Update()
         {
+            base.Update();
             if (isDead) return;
 
-            // Avance por los waypoints (heredado de Enemy)
-            base.Update();
-
-            // Temporizador para activar la habilidad especial del jefe
             abilityTimer -= Time.deltaTime;
             if (abilityTimer <= 0f)
             {
-                ExecuteBossAbility();
                 abilityTimer = abilityInterval;
+                ExecuteBossAbility();
             }
         }
 
         /// <summary>
-        /// Método virtual que cada script de jefe específico sobreescribe para su mecánica propia.
+        /// Cada jefe sobreescribe este método con su mecánica propia.
         /// </summary>
         protected virtual void ExecuteBossAbility()
         {
-            // Implementado por las clases hijas (Distortion, Feedback, etc.)
         }
 
-        public override void TakeDamage(float amount)
+        protected override void OnRemovedFromField(bool defeated)
         {
-            base.TakeDamage(amount);
+            OnBossDefeated?.Invoke(this);
+        }
 
-            // Si fue destruido
-            if (isDead)
+        // ---------- Utilidades compartidas por los jefes ----------
+
+        /// <summary>Deja una zona de ruido en el suelo, bajo el jefe.</summary>
+        protected void DeployNoiseZone(GameObject noiseZonePrefab)
+        {
+            if (noiseZonePrefab == null || Battlefield.Instance == null) return;
+
+            Vector3 pos = transform.position;
+            pos.y -= (hoverHeight - 0.012f) * Battlefield.Scale;
+            Transform field = Battlefield.Instance.transform;
+            Instantiate(noiseZonePrefab, pos, field.rotation, field);
+        }
+
+        /// <summary>Silencia las torres dentro del radio (unidades de campo). Devuelve cuántas.</summary>
+        protected int SilenceTowers(float radius, float duration)
+        {
+            float worldRadius = radius * Battlefield.Scale;
+            int count = 0;
+
+            for (int i = Tower.All.Count - 1; i >= 0; i--)
             {
-                OnBossDefeated?.Invoke(this);
+                Tower tower = Tower.All[i];
+                if (tower.IsSilenced) continue;
+                if (Vector3.Distance(tower.transform.position, transform.position) > worldRadius) continue;
+
+                tower.Silence(duration);
+                count++;
+            }
+
+            PulseEffect.Spawn(abilityVfxPrefab, transform.position, radius * 2f);
+            Sfx.Play(SfxId.Feedback);
+            return count;
+        }
+
+        /// <summary>Crea esbirros alrededor del jefe que continúan por el mismo camino.</summary>
+        protected void SpawnMinions(GameObject minionPrefab, int count, float spread)
+        {
+            if (minionPrefab == null || waypoints == null || waypoints.Length == 0) return;
+
+            int index = Mathf.Clamp(currentWaypointIndex, 0, waypoints.Length - 1);
+
+            for (int i = 0; i < count; i++)
+            {
+                Vector2 offset = UnityEngine.Random.insideUnitCircle * (spread * Battlefield.Scale);
+                Vector3 spawnPos = transform.position + new Vector3(offset.x, 0f, offset.y);
+
+                GameObject obj = Instantiate(minionPrefab, transform.parent);
+                Enemy minion = obj.GetComponent<Enemy>();
+                if (minion == null) continue;
+
+                minion.InitializePath(waypoints, index, spawnPos);
+                if (WaveSpawner.Instance != null) WaveSpawner.Instance.RegisterEnemy(minion);
             }
         }
     }

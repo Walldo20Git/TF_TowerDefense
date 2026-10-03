@@ -1,14 +1,17 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
+using ConcertDefense.AR;
 using ConcertDefense.Core;
 using ConcertDefense.Enemies;
+using ConcertDefense.Rhythm;
 
 namespace ConcertDefense.Towers
 {
     public enum TowerType
     {
         Bass,   // Onda expansiva de daño alto, cadencia lenta (Costo 50)
-        Treble, // Notas musicales rápidas, daño bajo, cadencia alta (Costo 40)
+        Treble, // Notas rápidas, daño bajo, cadencia alta (Costo 40)
         Echo,   // Pulso en área que ralentiza enemigos (Costo 60)
         Drop    // Explosión en área que empuja enemigos con física (Costo 80)
     }
@@ -16,70 +19,87 @@ namespace ConcertDefense.Towers
     [Serializable]
     public struct TowerStats
     {
-        [Tooltip("Daño base por disparo.")]
+        [Tooltip("Daño por disparo.")]
         public float damage;
 
-        [Tooltip("Alcance del radio de ataque en metros.")]
+        [Tooltip("Alcance en unidades de campo.")]
         public float range;
 
-        [Tooltip("Cadencia de disparo (disparos por segundo).")]
-        public float fireRate;
-
-        [Tooltip("Costo en monedas para ascender al siguiente nivel.")]
+        [Tooltip("Costo en monedas para subir al siguiente nivel (0 en el último).")]
         public int upgradeCost;
     }
 
     /// <summary>
-    /// Componente central de las torres de defensa:
-    /// - Detección de enemigos en rango y apuntado rotacional.
-    /// - Disparo de proyectiles sincronizable con el ritmo musical.
-    /// - Sistema de 3 niveles de mejora y venta con devolución del 60%.
-    /// - Estado de silenciado y afinación (mecánica del Jefe Feedback).
+    /// Torre-cantante (GDD 4.3 y 4.4):
+    /// - Busca al enemigo más avanzado dentro de su alcance y lo apunta.
+    /// - Dispara al ritmo: cada torre lanza un proyectil cada N medios tiempos del compás.
+    /// - Tres niveles (más daño y alcance), venta con devolución del 60 %.
+    /// - Puede quedar silenciada por el jefe Feedback hasta que el avatar la afine.
     /// </summary>
     public class Tower : MonoBehaviour
     {
+        /// <summary>Torres construidas. Lo usan los jefes y el avatar.</summary>
+        public static readonly List<Tower> All = new List<Tower>();
+
+        /// <summary>Multiplicador de daño global del ritmo (1.5 durante un compás tras un Perfect).</summary>
+        public static float RhythmMultiplier = 1f;
+
+        public const int MaxLevel = 3;
+        private const float HalfBeatFallback = 0.25f;
+
         [Header("Tipo e Identidad")]
         [SerializeField] private TowerType towerType = TowerType.Bass;
-        [SerializeField] private string towerName = "Bass Tower";
+        [SerializeField] private string towerName = "Bass";
         [SerializeField] private int baseCost = 50;
 
-        [Header("Niveles y Estadísticas (Nivel 1, 2 y 3)")]
-        [SerializeField] private int currentLevel = 1;
-        [SerializeField] private TowerStats[] statsPerLevel = new TowerStats[3]
+        [Header("Ritmo")]
+        [Tooltip("Dispara una vez cada tantos medios tiempos del compás (1 = muy rápida, 4 = cada tiempo y medio...).")]
+        [SerializeField] private int halfBeatsPerShot = 4;
+
+        [Header("Niveles (1, 2 y 3)")]
+        [SerializeField] private TowerStats[] statsPerLevel = new TowerStats[MaxLevel]
         {
-            new TowerStats { damage = 30f, range = 1.2f, fireRate = 1.0f, upgradeCost = 60 },
-            new TowerStats { damage = 50f, range = 1.5f, fireRate = 1.2f, upgradeCost = 90 },
-            new TowerStats { damage = 85f, range = 1.8f, fireRate = 1.5f, upgradeCost = 0  }
+            new TowerStats { damage = 34f, range = 0.50f, upgradeCost = 60 },
+            new TowerStats { damage = 52f, range = 0.58f, upgradeCost = 90 },
+            new TowerStats { damage = 80f, range = 0.68f, upgradeCost = 0 }
         };
 
-        [Header("Disparo y Puntos de Apuntado")]
+        [Header("Disparo")]
         [SerializeField] private GameObject projectilePrefab;
         [SerializeField] private Transform firePoint;
+        [Tooltip("Parte que gira para mirar al objetivo (la cantante).")]
         [SerializeField] private Transform rotatorPart;
+        [Tooltip("Onda visual al disparar.")]
+        [SerializeField] private GameObject shotVfxPrefab;
 
         [Header("Visualización y Estados")]
+        [Tooltip("Disco que muestra el alcance al seleccionar la torre.")]
         [SerializeField] private GameObject rangeVisualizer;
+        [Tooltip("Aviso visible mientras la torre está silenciada.")]
         [SerializeField] private GameObject silenceIndicator;
+        [Tooltip("Luz propia que se enciende si el entorno real está oscuro (modo noche).")]
+        [SerializeField] private Light nightLight;
 
-        // Variables de estado
         public TowerType Type => towerType;
         public string TowerName => towerName;
+        public int BaseCost => baseCost;
         public int CurrentLevel => currentLevel;
         public int TotalInvestedCoins { get; private set; }
-        public bool IsSilenced { get; private set; } = false;
+        public bool IsSilenced { get; private set; }
+        public BuildSpot Spot { get; set; }
 
-        public float CurrentDamage => GetCurrentStats().damage;
-        public float CurrentRange => GetCurrentStats().range;
-        public float CurrentFireRate => GetCurrentStats().fireRate;
-        public int CurrentUpgradeCost => GetCurrentStats().upgradeCost;
+        public float CurrentDamage => GetStats().damage;
+        public float CurrentRange => GetStats().range;
+        public int CurrentUpgradeCost => GetStats().upgradeCost;
+        public int SellRefund => Mathf.RoundToInt(TotalInvestedCoins * 0.6f);
 
-        // Multiplicador rítmico (ej: 1.5x en compás Perfect)
-        private float rhythmDamageMultiplier = 1f;
-        private float fireCountdown = 0f;
-        private Transform currentTarget;
-        private float silenceTimer = 0f;
+        private int currentLevel = 1;
+        private int ticksSinceShot;
+        private float fallbackTimer;
+        private float silenceTimer;
+        private Enemy currentTarget;
+        private Vector3 baseRotatorScale = Vector3.one;
 
-        // Eventos
         public static event Action<Tower> OnTowerClicked;
         public event Action<int> OnLevelChanged;
         public event Action<bool> OnSilenceStateChanged;
@@ -87,239 +107,235 @@ namespace ConcertDefense.Towers
         private void Awake()
         {
             TotalInvestedCoins = baseCost;
+            ticksSinceShot = halfBeatsPerShot; // lista para disparar en cuanto haya objetivo
+            if (rotatorPart != null) baseRotatorScale = rotatorPart.localScale;
+        }
+
+        private void OnEnable()
+        {
+            All.Add(this);
+            BeatClock.OnHalfBeat += HandleHalfBeat;
+            LightEstimationController.OnLowLightStateChanged += HandleLowLight;
+        }
+
+        private void OnDisable()
+        {
+            All.Remove(this);
+            BeatClock.OnHalfBeat -= HandleHalfBeat;
+            LightEstimationController.OnLowLightStateChanged -= HandleLowLight;
         }
 
         private void Start()
         {
-            UpdateRangeVisualizerScale();
+            UpdateLevelVisuals();
             HideRange();
-
-            if (silenceIndicator != null)
-            {
-                silenceIndicator.SetActive(false);
-            }
-
-            // Buscar objetivos periódicamente en lugar de cada fotograma
-            InvokeRepeating(nameof(UpdateTarget), 0f, 0.15f);
+            if (silenceIndicator != null) silenceIndicator.SetActive(false);
+            HandleLowLight(LightEstimationController.IsLowLight);
         }
 
         private void Update()
         {
-            // Gestión del temporizador de silencio (Jefe Feedback)
             if (IsSilenced)
             {
                 silenceTimer -= Time.deltaTime;
-                if (silenceTimer <= 0f)
-                {
-                    Tune();
-                }
+                if (silenceTimer <= 0f) Tune();
                 return;
             }
 
-            if (currentTarget == null) return;
-
-            // Apuntar hacia el enemigo
+            UpdateTarget();
             AimAtTarget();
 
-            // Cadencia de disparo
-            fireCountdown -= Time.deltaTime;
-            if (fireCountdown <= 0f)
+            // Si el reloj de ritmo no está en marcha, se mantiene la misma cadencia con un temporizador
+            if (!BeatClock.IsRunning)
             {
-                Shoot();
-                fireCountdown = 1f / Mathf.Max(0.1f, CurrentFireRate);
+                fallbackTimer += Time.deltaTime;
+                if (fallbackTimer >= HalfBeatFallback)
+                {
+                    fallbackTimer -= HalfBeatFallback;
+                    HandleHalfBeat(0);
+                }
             }
         }
 
-        /// <summary>
-        /// Localiza al enemigo más cercano dentro del radio de alcance de la torre.
-        /// </summary>
-        private void UpdateTarget()
+        private void HandleHalfBeat(int tick)
         {
             if (IsSilenced) return;
 
-            Collider[] colliders = Physics.OverlapSphere(transform.position, CurrentRange);
-            float shortestDistance = Mathf.Infinity;
-            Transform nearestEnemy = null;
+            ticksSinceShot++;
+            if (ticksSinceShot < halfBeatsPerShot) return;
+            if (currentTarget == null || currentTarget.IsDead) return;
 
-            foreach (var col in colliders)
-            {
-                if (col.CompareTag("Enemy"))
-                {
-                    float distanceToEnemy = Vector3.Distance(transform.position, col.transform.position);
-                    if (distanceToEnemy < shortestDistance)
-                    {
-                        shortestDistance = distanceToEnemy;
-                        nearestEnemy = col.transform;
-                    }
-                }
-            }
-
-            currentTarget = nearestEnemy;
+            ticksSinceShot = 0;
+            Shoot();
         }
 
         /// <summary>
-        /// Rota la cabeza o parte superior de la torre suavemente hacia el enemigo objetivo.
+        /// Elige al enemigo más avanzado en el camino dentro del alcance.
         /// </summary>
+        private void UpdateTarget()
+        {
+            float worldRange = CurrentRange * Battlefield.Scale;
+            float sqrRange = worldRange * worldRange;
+            float bestProgress = float.MinValue;
+            Enemy best = null;
+
+            for (int i = 0; i < Enemy.All.Count; i++)
+            {
+                Enemy enemy = Enemy.All[i];
+                if (enemy.IsDead) continue;
+
+                Vector3 delta = enemy.transform.position - transform.position;
+                delta.y = 0f;
+                if (delta.sqrMagnitude > sqrRange) continue;
+
+                float progress = enemy.PathProgress;
+                if (progress > bestProgress)
+                {
+                    bestProgress = progress;
+                    best = enemy;
+                }
+            }
+
+            currentTarget = best;
+        }
+
         private void AimAtTarget()
         {
             if (rotatorPart == null || currentTarget == null) return;
 
-            Vector3 direction = currentTarget.position - transform.position;
-            direction.y = 0f; // Mantener rotación sobre el plano horizontal
+            Vector3 direction = currentTarget.transform.position - rotatorPart.position;
+            direction.y = 0f;
+            if (direction.sqrMagnitude < 0.000001f) return;
 
-            if (direction != Vector3.zero)
-            {
-                Quaternion lookRotation = Quaternion.LookRotation(direction);
-                rotatorPart.rotation = Quaternion.Slerp(rotatorPart.rotation, lookRotation, Time.deltaTime * 12f);
-            }
+            Quaternion look = Quaternion.LookRotation(direction);
+            rotatorPart.rotation = Quaternion.Slerp(rotatorPart.rotation, look, Time.deltaTime * 12f);
         }
 
-        /// <summary>
-        /// Instancia y dispara el proyectil correspondiente hacia el objetivo actual.
-        /// </summary>
         private void Shoot()
         {
-            if (projectilePrefab == null || firePoint == null || currentTarget == null) return;
+            if (projectilePrefab == null || Battlefield.Instance == null) return;
 
-            GameObject projObj = Instantiate(projectilePrefab, firePoint.position, firePoint.rotation);
-            Projectile projectile = projObj.GetComponent<Projectile>();
+            Vector3 origin = firePoint != null ? firePoint.position : transform.position;
+            Vector3 toTarget = currentTarget.transform.position - origin;
+            Quaternion rotation = toTarget.sqrMagnitude > 0.000001f ? Quaternion.LookRotation(toTarget) : Quaternion.identity;
 
+            GameObject obj = Instantiate(projectilePrefab, origin, rotation, Battlefield.Instance.Projectiles);
+            Projectile projectile = obj.GetComponent<Projectile>();
             if (projectile != null)
             {
-                float totalDamage = CurrentDamage * rhythmDamageMultiplier;
-                projectile.Initialize(currentTarget, totalDamage);
+                projectile.Launch(currentTarget, CurrentDamage * RhythmMultiplier);
             }
+
+            PulseEffect.Spawn(shotVfxPrefab, origin);
+            Sfx.Play(SfxId.Shoot);
         }
 
         /// <summary>
-        /// Aplica el multiplicador de daño rítmico (Perfect = 1.5x) durante la ventana del compás.
-        /// </summary>
-        public void SetRhythmMultiplier(float multiplier)
-        {
-            rhythmDamageMultiplier = multiplier;
-        }
-
-        /// <summary>
-        /// Sube la torre de nivel si no ha alcanzado el nivel 3 y el jugador tiene monedas suficientes.
+        /// Sube de nivel si no está al máximo y hay monedas.
         /// </summary>
         public bool TryUpgrade()
         {
-            if (currentLevel >= 3)
-            {
-                Debug.Log($"[Tower] {towerName} ya está en su nivel máximo (Nivel 3).");
-                return false;
-            }
+            if (currentLevel >= MaxLevel) return false;
 
             int cost = CurrentUpgradeCost;
-            if (GameManager.Instance != null && GameManager.Instance.TrySpendCoins(cost))
-            {
-                TotalInvestedCoins += cost;
-                currentLevel++;
-                UpdateRangeVisualizerScale();
-                OnLevelChanged?.Invoke(currentLevel);
-                Debug.Log($"[Tower] {towerName} mejorada a Nivel {currentLevel}.");
-                return true;
-            }
+            if (GameManager.Instance == null || !GameManager.Instance.TrySpendCoins(cost)) return false;
 
-            return false;
+            TotalInvestedCoins += cost;
+            currentLevel++;
+            UpdateLevelVisuals();
+            Sfx.Play(SfxId.Build);
+            OnLevelChanged?.Invoke(currentLevel);
+            return true;
         }
 
         /// <summary>
-        /// Vende la torre devolviendo el 60% de todo lo invertido (compra inicial + mejoras).
+        /// Vende la torre: devuelve el 60 % de lo invertido y libera la plataforma.
         /// </summary>
         public void Sell()
         {
-            int refund = Mathf.RoundToInt(TotalInvestedCoins * 0.6f);
-            if (GameManager.Instance != null)
-            {
-                GameManager.Instance.AddCoins(refund);
-            }
+            if (GameManager.Instance != null) GameManager.Instance.AddCoins(SellRefund);
+            if (Spot != null) Spot.ClearSpot();
 
-            Debug.Log($"[Tower] {towerName} vendida por {refund} monedas.");
+            Sfx.Play(SfxId.Build);
             Destroy(gameObject);
         }
 
         /// <summary>
-        /// Silencia la torre impidiendo que dispare (habilidad del Jefe Feedback).
+        /// Silencia la torre (jefe Feedback): no dispara hasta que el avatar la afine o pase el tiempo.
         /// </summary>
         public void Silence(float duration)
         {
             IsSilenced = true;
             silenceTimer = duration;
+            currentTarget = null;
 
-            if (silenceIndicator != null)
-            {
-                silenceIndicator.SetActive(true);
-            }
-
+            if (silenceIndicator != null) silenceIndicator.SetActive(true);
             OnSilenceStateChanged?.Invoke(true);
         }
 
         /// <summary>
-        /// Reactiva la torre (al afinarla con el avatar o finalizar el tiempo).
+        /// Reactiva la torre.
         /// </summary>
         public void Tune()
         {
+            if (!IsSilenced) return;
+
             IsSilenced = false;
             silenceTimer = 0f;
 
-            if (silenceIndicator != null)
-            {
-                silenceIndicator.SetActive(false);
-            }
-
+            if (silenceIndicator != null) silenceIndicator.SetActive(false);
             OnSilenceStateChanged?.Invoke(false);
-            Debug.Log($"[Tower] {towerName} afinada y reactivada.");
         }
 
         /// <summary>
-        /// Muestra la retícula o círculo de alcance.
+        /// La torre fue tocada: muestra su alcance y abre el menú flotante.
         /// </summary>
+        public void Select()
+        {
+            ShowRange();
+            OnTowerClicked?.Invoke(this);
+        }
+
         public void ShowRange()
         {
-            if (rangeVisualizer != null)
-            {
-                rangeVisualizer.SetActive(true);
-            }
+            if (rangeVisualizer != null) rangeVisualizer.SetActive(true);
         }
 
-        /// <summary>
-        /// Oculta el círculo de alcance.
-        /// </summary>
         public void HideRange()
         {
-            if (rangeVisualizer != null)
-            {
-                rangeVisualizer.SetActive(false);
-            }
+            if (rangeVisualizer != null) rangeVisualizer.SetActive(false);
         }
 
-        private void UpdateRangeVisualizerScale()
+        private void UpdateLevelVisuals()
         {
             if (rangeVisualizer != null)
             {
                 float diameter = CurrentRange * 2f;
                 rangeVisualizer.transform.localScale = new Vector3(diameter, rangeVisualizer.transform.localScale.y, diameter);
             }
+
+            // La cantante crece un poco con cada nivel
+            if (rotatorPart != null)
+            {
+                rotatorPart.localScale = baseRotatorScale * (1f + 0.15f * (currentLevel - 1));
+            }
         }
 
-        private TowerStats GetCurrentStats()
+        private void HandleLowLight(bool isDark)
+        {
+            if (nightLight != null) nightLight.enabled = isDark;
+        }
+
+        private TowerStats GetStats()
         {
             int index = Mathf.Clamp(currentLevel - 1, 0, statsPerLevel.Length - 1);
             return statsPerLevel[index];
         }
 
-        private void OnMouseDown()
-        {
-            // Notificar selección al tocar la torre para abrir menú flotante
-            ShowRange();
-            OnTowerClicked?.Invoke(this);
-        }
-
         private void OnDrawGizmosSelected()
         {
             Gizmos.color = Color.cyan;
-            Gizmos.DrawWireSphere(transform.position, CurrentRange);
+            Gizmos.DrawWireSphere(transform.position, CurrentRange * transform.lossyScale.x);
         }
     }
 }

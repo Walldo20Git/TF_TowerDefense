@@ -9,6 +9,7 @@ TagManager:
   - BuildSpot
   - Avatar
   - Field
+  - TeleportPad
   layers:
   - Default
   - TransparentFX

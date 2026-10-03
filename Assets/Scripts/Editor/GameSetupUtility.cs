@@ -1,1332 +1,1501 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
-using UnityEngine;
-using UnityEngine.UI;
+using System.Linq;
+using TMPro;
+using Unity.XR.CoreUtils;
 using UnityEditor;
 using UnityEditor.SceneManagement;
-using TMPro;
-using ConcertDefense.Core;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem.UI;
+using UnityEngine.UI;
+using UnityEngine.XR.ARFoundation;
 using ConcertDefense.AR;
-using ConcertDefense.Towers;
+using ConcertDefense.Core;
 using ConcertDefense.Enemies;
 using ConcertDefense.Player;
 using ConcertDefense.Rhythm;
+using ConcertDefense.Towers;
 using ConcertDefense.UI;
 
 namespace ConcertDefense.EditorTools
 {
+    /// <summary>
+    /// Montaje automático del juego: genera materiales, audio, prefabs, HUD y deja la escena lista.
+    /// Menú: ConcertDefense → Setup Complete Game. Se puede volver a ejecutar sin duplicar nada.
+    /// </summary>
     public static class GameSetupUtility
     {
-        private const string MATERIALS_PATH = "Assets/Materials";
-        private const string PREFABS_PATH = "Assets/Prefabs";
-        private const string AUDIO_PATH = "Assets/Audio";
+        private const string ScenePath = "Assets/Scenes/SampleScene.unity";
+        private const string MaterialsPath = "Assets/Materials";
+        private const string PrefabsPath = "Assets/Prefabs";
+        private const string AudioPath = "Assets/Audio";
+        private const string FontPath = "Assets/TextMesh Pro/Resources/Fonts & Materials/LiberationSans SDF.asset";
+
+        // Paleta (GDD 8): turquesa, cian, negro y blanco con acentos magenta; glitches en rojo y negro
+        private static readonly Color Turquoise = new Color(0f, 0.85f, 0.8f);
+        private static readonly Color IceCyan = new Color(0.6f, 0.95f, 1f);
+        private static readonly Color Magenta = new Color(1f, 0.15f, 0.6f);
+        private static readonly Color Ink = new Color(0.07f, 0.08f, 0.12f);
+        private static readonly Color White = new Color(0.95f, 0.97f, 1f);
+        private static readonly Color Skin = new Color(1f, 0.86f, 0.76f);
+        private static readonly Color GlitchRed = new Color(0.95f, 0.1f, 0.15f);
+        private static readonly Color PanelColor = new Color(0.05f, 0.07f, 0.12f, 0.88f);
+
+        private static Dictionary<string, Material> mats;
+        private static Dictionary<string, GameObject> vfx;
+        private static TMP_FontAsset font;
+        private static Sprite roundedSprite;
+        private static Sprite circleSprite;
+
+        private struct TowerDef
+        {
+            public TowerType type;
+            public string name;
+            public string description;
+            public int cost;
+            public int halfBeats;
+            public Color hair;
+            public Color dress;
+            public Color accent;
+            public GameObject projectile;
+            public TowerStats[] stats;
+            public GameObject prefab;
+        }
 
         [MenuItem("ConcertDefense/Setup Complete Game (Generate All Assets & Scene)", priority = 1)]
         public static void SetupCompleteGame()
         {
             Debug.Log("[ConcertDefense] Iniciando montaje completo del juego...");
+
             CreateDirectories();
+            font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>(FontPath);
+            roundedSprite = AssetDatabase.GetBuiltinExtraResource<Sprite>("UI/Skin/UISprite.psd");
+            circleSprite = AssetDatabase.GetBuiltinExtraResource<Sprite>("UI/Skin/Knob.psd");
 
-            AudioClip bgmClip = GenerateSynthBGM();
-            AudioClip sfxTeleport = GenerateBeepSFX("TeleportSFX.wav", 600f, 1200f, 0.3f);
-            AudioClip sfxFeedback = GenerateBeepSFX("FeedbackSFX.wav", 880f, 440f, 0.5f);
+            Dictionary<SfxId, AudioClip> sfxClips = GenerateAudio(out AudioClip bgm);
+            CreateMaterials();
+            CreateVfxPrefabs();
 
-            Dictionary<string, Material> materials = CreateMaterials();
-            var projectiles = CreateProjectiles(materials);
-            var towers = CreateTowers(materials, projectiles);
-            var enemies = CreateEnemiesAndBosses(materials, sfxFeedback);
+            GameObject enemyBar = CreateHealthBarPrefab("EnemyHealthBar", new Vector2(100f, 12f), false);
+            GameObject bossBar = CreateHealthBarPrefab("BossHealthBar", new Vector2(220f, 18f), true);
 
-            GameObject avatarPrefab = CreateAvatarPrefab(materials);
-            GameObject reticlePrefab = CreateReticlePrefab(materials);
-            GameObject battlefieldPrefab = CreateBattlefieldPrefab(materials, avatarPrefab, sfxTeleport);
+            Dictionary<string, GameObject> enemies = CreateEnemies(enemyBar, bossBar);
+            TowerDef[] towers = CreateTowers();
+            GameObject avatar = CreateAvatarPrefab();
+            GameObject reticle = CreateReticlePrefab();
+            GameObject battlefield = CreateBattlefieldPrefab(avatar);
 
-            AssembleScene(bgmClip, battlefieldPrefab, reticlePrefab, towers, enemies);
+            AssembleScene(bgm, sfxClips, battlefield, reticle, towers, enemies);
+            ApplyProjectSettings();
 
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
-
-            Debug.Log("<color=#00FFFF><b>[ConcertDefense] ¡Montaje completado con éxito! Todos los prefabs, audio, materiales, HUD y la escena han sido configurados.</b></color>");
+            Debug.Log("[ConcertDefense] Montaje completado: materiales, audio, prefabs, HUD y escena configurados.");
         }
 
         private static void CreateDirectories()
         {
-            string[] dirs = {
-                MATERIALS_PATH,
-                AUDIO_PATH,
-                PREFABS_PATH,
-                $"{PREFABS_PATH}/Towers",
-                $"{PREFABS_PATH}/Projectiles",
-                $"{PREFABS_PATH}/Enemies",
-                $"{PREFABS_PATH}/Bosses",
-                $"{PREFABS_PATH}/Environment"
+            string[] dirs =
+            {
+                MaterialsPath, AudioPath, PrefabsPath,
+                PrefabsPath + "/Towers", PrefabsPath + "/Projectiles", PrefabsPath + "/Enemies",
+                PrefabsPath + "/Bosses", PrefabsPath + "/Environment", PrefabsPath + "/VFX", PrefabsPath + "/UI"
             };
 
-            foreach (var dir in dirs)
+            foreach (string dir in dirs)
             {
-                if (!AssetDatabase.IsValidFolder(dir))
-                {
-                    string parent = Path.GetDirectoryName(dir).Replace("\\", "/");
-                    string folderName = Path.GetFileName(dir);
-                    AssetDatabase.CreateFolder(parent, folderName);
-                }
+                if (AssetDatabase.IsValidFolder(dir)) continue;
+                AssetDatabase.CreateFolder(Path.GetDirectoryName(dir).Replace("\\", "/"), Path.GetFileName(dir));
             }
         }
 
-        #region Material Generation
-        private static Dictionary<string, Material> CreateMaterials()
-        {
-            var dict = new Dictionary<string, Material>();
-            Shader urpShader = Shader.Find("Universal Render Pipeline/Lit");
-            if (urpShader == null) urpShader = Shader.Find("Universal Render Pipeline/Unlit");
-            if (urpShader == null) urpShader = Shader.Find("Standard");
+        #region Utilidades
 
-            Material CreateMat(string name, Color baseColor, Color emissionColor, float smoothness = 0.5f, bool transparent = false)
+        /// <summary>Asigna campos [SerializeField] por nombre.</summary>
+        private static void SetProps(UnityEngine.Object target, params (string name, object value)[] props)
+        {
+            var so = new SerializedObject(target);
+            foreach ((string name, object value) in props)
             {
-                string path = $"{MATERIALS_PATH}/{name}.mat";
+                SerializedProperty p = so.FindProperty(name);
+                if (p == null)
+                {
+                    Debug.LogError($"[ConcertDefense] {target.GetType().Name} no tiene el campo '{name}'.");
+                    continue;
+                }
+
+                switch (value)
+                {
+                    case null: p.objectReferenceValue = null; break;
+                    case bool b: p.boolValue = b; break;
+                    case int i: p.intValue = i; break;
+                    case float f: p.floatValue = f; break;
+                    case string s: p.stringValue = s; break;
+                    case Color c: p.colorValue = c; break;
+                    case Vector2 v2: p.vector2Value = v2; break;
+                    case Vector3 v3: p.vector3Value = v3; break;
+                    case Enum e: p.enumValueIndex = Convert.ToInt32(e); break;
+                    case UnityEngine.Object o: p.objectReferenceValue = o; break;
+                    default: Debug.LogError($"[ConcertDefense] Tipo no soportado para '{name}'."); break;
+                }
+            }
+            so.ApplyModifiedPropertiesWithoutUndo();
+        }
+
+        private static GameObject Empty(string name, Transform parent, Vector3 localPos)
+        {
+            var go = new GameObject(name);
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = localPos;
+            return go;
+        }
+
+        /// <summary>Primitiva visual sin collider.</summary>
+        private static GameObject Prim(PrimitiveType type, string name, Transform parent, Vector3 localPos, Vector3 localScale, Material mat, Vector3? euler = null)
+        {
+            GameObject go = GameObject.CreatePrimitive(type);
+            go.name = name;
+            UnityEngine.Object.DestroyImmediate(go.GetComponent<Collider>());
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = localPos;
+            go.transform.localScale = localScale;
+            if (euler.HasValue) go.transform.localEulerAngles = euler.Value;
+
+            var renderer = go.GetComponent<MeshRenderer>();
+            renderer.sharedMaterial = mat;
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            return go;
+        }
+
+        /// <summary>Barra fina entre dos puntos (raíles, soportes, tramos del camino).</summary>
+        private static GameObject Segment(string name, Transform parent, Vector3 a, Vector3 b, float width, float height, Material mat)
+        {
+            Vector3 delta = b - a;
+            GameObject go = Prim(PrimitiveType.Cube, name, parent, (a + b) * 0.5f, new Vector3(width, height, delta.magnitude), mat);
+            if (delta.sqrMagnitude > 0.000001f) go.transform.localRotation = Quaternion.LookRotation(delta.normalized);
+            return go;
+        }
+
+        private static GameObject SavePrefab(GameObject root, string path)
+        {
+            GameObject prefab = PrefabUtility.SaveAsPrefabAsset(root, path);
+            UnityEngine.Object.DestroyImmediate(root);
+            return prefab;
+        }
+
+        #endregion
+
+        #region Materiales
+
+        private static void CreateMaterials()
+        {
+            mats = new Dictionary<string, Material>();
+
+            Shader toon = Shader.Find("ConcertDefense/Toon");
+            Shader unlit = Shader.Find("ConcertDefense/UnlitColor");
+            if (toon == null) toon = Shader.Find("Universal Render Pipeline/Lit");
+            if (unlit == null) unlit = Shader.Find("Universal Render Pipeline/Unlit");
+
+            Material Create(string name, Shader shader, Color baseColor, Color emission)
+            {
+                string path = $"{MaterialsPath}/{name}.mat";
                 Material mat = AssetDatabase.LoadAssetAtPath<Material>(path);
                 if (mat == null)
                 {
-                    mat = new Material(urpShader);
+                    mat = new Material(shader);
                     AssetDatabase.CreateAsset(mat, path);
                 }
-                mat.color = baseColor;
-                if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", baseColor);
-                if (mat.HasProperty("_EmissionColor"))
+                else
                 {
-                    mat.EnableKeyword("_EMISSION");
-                    mat.SetColor("_EmissionColor", emissionColor);
-                }
-                if (mat.HasProperty("_Smoothness")) mat.SetFloat("_Smoothness", smoothness);
-
-                if (transparent)
-                {
-                    mat.SetFloat("_Surface", 1); // Transparent
-                    mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-                    mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-                    mat.SetInt("_ZWrite", 0);
-                    mat.DisableKeyword("_ALPHATEST_ON");
-                    mat.EnableKeyword("_ALPHABLEND_ON");
-                    mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-                    mat.renderQueue = 3000;
+                    mat.shader = shader;
                 }
 
+                mat.SetColor("_BaseColor", baseColor);
+                if (mat.HasProperty("_EmissionColor")) mat.SetColor("_EmissionColor", emission);
+                mat.enableInstancing = true;
                 EditorUtility.SetDirty(mat);
-                dict[name] = mat;
+                mats[name] = mat;
                 return mat;
             }
 
-            CreateMat("Mat_NeonCyan", new Color(0f, 1f, 0.95f), new Color(0f, 0.8f, 0.75f) * 2f, 0.8f);
-            CreateMat("Mat_NeonMagenta", new Color(1f, 0.1f, 0.7f), new Color(0.9f, 0f, 0.6f) * 2f, 0.8f);
-            CreateMat("Mat_NeonYellow", new Color(1f, 0.92f, 0.15f), new Color(0.9f, 0.8f, 0f) * 2f, 0.8f);
-            CreateMat("Mat_NeonPurple", new Color(0.7f, 0.2f, 1f), new Color(0.6f, 0f, 0.9f) * 2f, 0.8f);
-            CreateMat("Mat_DarkStage", new Color(0.12f, 0.12f, 0.18f), Color.black, 0.4f);
-            CreateMat("Mat_FieldPath", new Color(0.2f, 0.22f, 0.28f), new Color(0f, 0.2f, 0.3f) * 0.5f, 0.6f);
-            CreateMat("Mat_BuildSpotNormal", new Color(0.2f, 0.8f, 1f, 0.7f), new Color(0f, 0.5f, 0.7f) * 1.5f, 0.7f, true);
-            CreateMat("Mat_BuildSpotInRange", new Color(0f, 1f, 0.5f, 0.8f), new Color(0f, 1f, 0.4f) * 2f, 0.8f, true);
-            CreateMat("Mat_BuildSpotOutOfRange", new Color(1f, 0.2f, 0.2f, 0.8f), new Color(1f, 0.1f, 0.1f) * 2f, 0.8f, true);
-            CreateMat("Mat_NoiseZone", new Color(0.8f, 0.1f, 0.9f, 0.35f), new Color(0.6f, 0f, 0.8f), 0.2f, true);
-            CreateMat("Mat_Reticle", new Color(0f, 1f, 0.9f, 0.75f), new Color(0f, 1f, 0.8f) * 2.5f, 0.9f, true);
-            CreateMat("Mat_WhiteMetal", new Color(0.95f, 0.95f, 0.98f), new Color(0.1f, 0.1f, 0.15f), 0.7f);
-            CreateMat("Mat_EnemyPixel", new Color(0f, 0.9f, 1f), new Color(0f, 0.8f, 1f) * 1.5f, 0.7f);
-            CreateMat("Mat_EnemyStatic", new Color(1f, 0.2f, 0.5f), new Color(1f, 0.1f, 0.4f) * 1.5f, 0.7f);
-            CreateMat("Mat_EnemyAmp", new Color(1f, 0.85f, 0.2f), new Color(1f, 0.75f, 0f) * 1.5f, 0.7f);
-            CreateMat("Mat_BossDark", new Color(0.15f, 0.05f, 0.25f), new Color(0.8f, 0f, 0.8f) * 1.5f, 0.8f);
+            void Toon(string name, Color color, float glow = 0f) => Create(name, toon, color, color * glow);
+            void Unlit(string name, Color color) => Create(name, unlit, color, Color.black);
 
-            return dict;
+            Toon("Mat_Turquoise", Turquoise, 0.25f);
+            Toon("Mat_IceCyan", IceCyan, 0.2f);
+            Toon("Mat_Magenta", Magenta, 0.25f);
+            Toon("Mat_Ink", Ink);
+            Toon("Mat_White", White, 0.1f);
+            Toon("Mat_Skin", Skin, 0.1f);
+            Toon("Mat_LeekGreen", new Color(0.35f, 0.85f, 0.3f), 0.2f);
+            Toon("Mat_GlitchRed", GlitchRed, 0.35f);
+            Toon("Mat_GlitchBlack", new Color(0.09f, 0.03f, 0.05f));
+            Toon("Mat_Ground", new Color(0.09f, 0.11f, 0.18f));
+            Toon("Mat_Path", new Color(0.2f, 0.16f, 0.32f), 0.15f);
+
+            Unlit("Mat_Grid", new Color(0f, 0.95f, 0.9f, 0.3f));
+            Unlit("Mat_Range", new Color(0f, 0.95f, 0.9f, 0.18f));
+            Unlit("Mat_Indicator", new Color(0.1f, 1f, 0.45f, 0.85f));
+            Unlit("Mat_Reticle", new Color(0f, 0.95f, 0.9f, 0.9f));
+            Unlit("Mat_Noise", new Color(0.75f, 0.1f, 0.9f, 0.35f));
+            Unlit("Mat_Fx", new Color(1f, 1f, 1f, 0.8f));
+            Unlit("Mat_Hologram", new Color(0.2f, 1f, 0.95f, 0.45f));
+
+            // Los materiales del avance anterior ya no se usan
+            foreach (string old in new[]
+            {
+                "Mat_BossDark", "Mat_BuildSpotInRange", "Mat_BuildSpotNormal", "Mat_BuildSpotOutOfRange", "Mat_DarkStage",
+                "Mat_EnemyAmp", "Mat_EnemyPixel", "Mat_EnemyStatic", "Mat_FieldPath", "Mat_NeonCyan", "Mat_NeonMagenta",
+                "Mat_NeonPurple", "Mat_NeonYellow", "Mat_NoiseZone", "Mat_WhiteMetal"
+            })
+            {
+                AssetDatabase.DeleteAsset($"{MaterialsPath}/{old}.mat");
+            }
         }
+
         #endregion
 
-        #region Audio Generation
-        private static AudioClip GenerateSynthBGM()
+        #region Audio
+
+        private static Dictionary<SfxId, AudioClip> GenerateAudio(out AudioClip bgm)
         {
-            string filePath = $"{AUDIO_PATH}/BGM_120BPM_CyberConcert.wav";
-            int sampleRate = 44100;
-            float bpm = 120f;
-            float beatDuration = 60f / bpm; // 0.5 sec
-            int totalBeats = 16; // 4 bars = 8 seconds loop
-            int totalSamples = (int)(sampleRate * totalBeats * beatDuration);
+            const int rate = 44100;
+            var noise = new System.Random(7);
 
-            float[] samples = new float[totalSamples];
+            // --- Pista principal: 120 BPM, 16 tiempos (8 s) en bucle, de autoría propia ---
+            float beat = 0.5f;
+            var music = new float[(int)(rate * beat * 16)];
+            float[] bass = { 110f, 110f, 130.81f, 130.81f, 146.83f, 146.83f, 98f, 98f };
+            float[] lead = { 440f, 523.25f, 659.25f, 523.25f, 587.33f, 659.25f, 783.99f, 659.25f, 440f, 523.25f, 659.25f, 880f, 783.99f, 659.25f, 587.33f, 523.25f };
 
-            for (int i = 0; i < totalSamples; i++)
+            for (int i = 0; i < music.Length; i++)
             {
-                float time = (float)i / sampleRate;
-                float beatTime = time % beatDuration;
-                int currentBeat = (int)(time / beatDuration);
+                float t = (float)i / rate;
+                float beatTime = t % beat;
+                int beatIndex = (int)(t / beat);
 
-                // 1. Kick en cada pulso (compás de 4/4)
-                float kickFreq = Mathf.Lerp(150f, 40f, Mathf.Clamp01(beatTime / 0.15f));
-                float kickEnv = Mathf.Exp(-beatTime * 14f);
-                float kick = Mathf.Sin(2f * Mathf.PI * kickFreq * beatTime) * kickEnv * 0.7f;
+                float kickFreq = Mathf.Lerp(150f, 45f, Mathf.Clamp01(beatTime / 0.12f));
+                float kick = Mathf.Sin(2f * Mathf.PI * kickFreq * beatTime) * Mathf.Exp(-beatTime * 14f) * 0.75f;
 
-                // 2. Hi-Hat en octavas (cada 0.25 s)
-                float hatTime = time % (beatDuration * 0.5f);
-                float hatEnv = Mathf.Exp(-hatTime * 45f);
-                float hat = (Random.value * 2f - 1f) * hatEnv * 0.18f;
+                float hatTime = t % (beat * 0.5f);
+                float hat = ((float)noise.NextDouble() * 2f - 1f) * Mathf.Exp(-hatTime * 50f) * 0.14f;
 
-                // 3. Synth Bassline melódica en 120 BPM
-                float[] notes = { 110f, 130.81f, 146.83f, 164.81f }; // A2, C3, D3, E3
-                float currentFreq = notes[(currentBeat / 2) % notes.Length];
-                float bassEnv = Mathf.Exp(-beatTime * 4f);
-                float bass = Mathf.Sin(2f * Mathf.PI * currentFreq * time) * bassEnv * 0.35f;
+                float bassFreq = bass[(beatIndex / 2) % bass.Length];
+                float bassNote = Mathf.Sin(2f * Mathf.PI * bassFreq * t) * Mathf.Exp(-beatTime * 3f) * 0.32f;
 
-                samples[i] = Mathf.Clamp(kick + hat + bass, -1f, 1f);
+                float leadFreq = lead[beatIndex % lead.Length];
+                float leadNote = Mathf.Sign(Mathf.Sin(2f * Mathf.PI * leadFreq * t)) * Mathf.Exp(-beatTime * 6f) * 0.07f;
+
+                music[i] = Mathf.Clamp(kick + hat + bassNote + leadNote, -1f, 1f);
             }
 
-            WriteWavFile(filePath, samples, sampleRate);
-            AssetDatabase.ImportAsset(filePath, ImportAssetOptions.ForceUpdate);
-            return AssetDatabase.LoadAssetAtPath<AudioClip>(filePath);
-        }
+            bgm = SaveClip("BGM_120BPM_CyberConcert.wav", music, rate);
 
-        private static AudioClip GenerateBeepSFX(string fileName, float startFreq, float endFreq, float duration)
-        {
-            string filePath = $"{AUDIO_PATH}/{fileName}";
-            int sampleRate = 44100;
-            int totalSamples = (int)(sampleRate * duration);
-            float[] samples = new float[totalSamples];
-
-            for (int i = 0; i < totalSamples; i++)
+            // --- Efectos ---
+            float[] Sweep(float from, float to, float duration, float volume, float noiseMix = 0f, float tremolo = 0f)
             {
-                float t = (float)i / totalSamples;
-                float freq = Mathf.Lerp(startFreq, endFreq, t);
-                float env = Mathf.Sin(t * Mathf.PI);
-                samples[i] = Mathf.Sin(2f * Mathf.PI * freq * ((float)i / sampleRate)) * env * 0.6f;
+                var data = new float[(int)(rate * duration)];
+                double phase = 0;
+                for (int i = 0; i < data.Length; i++)
+                {
+                    float t = (float)i / data.Length;
+                    float freq = Mathf.Lerp(from, to, t);
+                    phase += 2.0 * Math.PI * freq / rate;
+                    float env = Mathf.Sin(t * Mathf.PI);
+                    float tone = (float)Math.Sin(phase);
+                    float n = (float)noise.NextDouble() * 2f - 1f;
+                    float trem = tremolo > 0f ? 0.6f + 0.4f * Mathf.Sin(2f * Mathf.PI * tremolo * t * duration) : 1f;
+                    data[i] = Mathf.Lerp(tone, n, noiseMix) * env * trem * volume;
+                }
+                return data;
             }
 
-            WriteWavFile(filePath, samples, sampleRate);
-            AssetDatabase.ImportAsset(filePath, ImportAssetOptions.ForceUpdate);
-            return AssetDatabase.LoadAssetAtPath<AudioClip>(filePath);
+            float[] Concat(params float[][] parts) => parts.SelectMany(p => p).ToArray();
+
+            var clips = new Dictionary<SfxId, AudioClip>
+            {
+                [SfxId.Shoot] = SaveClip("ShootSFX.wav", Sweep(900f, 500f, 0.07f, 0.35f), rate),
+                [SfxId.Impact] = SaveClip("ImpactSFX.wav", Sweep(220f, 90f, 0.1f, 0.45f, 0.5f), rate),
+                [SfxId.Build] = SaveClip("BuildSFX.wav", Concat(Sweep(523f, 523f, 0.08f, 0.5f), Sweep(659f, 659f, 0.08f, 0.5f), Sweep(784f, 784f, 0.12f, 0.5f)), rate),
+                [SfxId.Teleport] = SaveClip("TeleportSFX.wav", Sweep(600f, 1400f, 0.3f, 0.55f), rate),
+                [SfxId.Perfect] = SaveClip("PerfectSFX.wav", Concat(Sweep(1318f, 1318f, 0.06f, 0.5f), Sweep(1760f, 1760f, 0.12f, 0.5f)), rate),
+                [SfxId.Good] = SaveClip("GoodSFX.wav", Sweep(880f, 880f, 0.1f, 0.45f), rate),
+                [SfxId.BossArrive] = SaveClip("BossArriveSFX.wav", Sweep(130f, 65f, 0.8f, 0.7f, 0.15f, 9f), rate),
+                [SfxId.Feedback] = SaveClip("FeedbackSFX.wav", Sweep(1800f, 2600f, 0.5f, 0.4f, 0.1f, 14f), rate),
+                [SfxId.Ultimate] = SaveClip("UltimateSFX.wav", Sweep(180f, 1500f, 0.7f, 0.6f, 0.1f), rate),
+                [SfxId.StageHit] = SaveClip("StageHitSFX.wav", Sweep(160f, 60f, 0.28f, 0.7f, 0.25f), rate)
+            };
+            return clips;
         }
 
-        private static void WriteWavFile(string path, float[] samples, int sampleRate)
+        private static AudioClip SaveClip(string fileName, float[] samples, int sampleRate)
         {
+            string path = $"{AudioPath}/{fileName}";
             byte[] wav = new byte[44 + samples.Length * 2];
-            int byteRate = sampleRate * 2;
 
-            // RIFF header
             System.Text.Encoding.ASCII.GetBytes("RIFF").CopyTo(wav, 0);
-            System.BitConverter.GetBytes(wav.Length - 8).CopyTo(wav, 4);
+            BitConverter.GetBytes(wav.Length - 8).CopyTo(wav, 4);
             System.Text.Encoding.ASCII.GetBytes("WAVE").CopyTo(wav, 8);
             System.Text.Encoding.ASCII.GetBytes("fmt ").CopyTo(wav, 12);
-            System.BitConverter.GetBytes(16).CopyTo(wav, 16);
-            System.BitConverter.GetBytes((short)1).CopyTo(wav, 20); // PCM
-            System.BitConverter.GetBytes((short)1).CopyTo(wav, 22); // Mono
-            System.BitConverter.GetBytes(sampleRate).CopyTo(wav, 24);
-            System.BitConverter.GetBytes(byteRate).CopyTo(wav, 28);
-            System.BitConverter.GetBytes((short)2).CopyTo(wav, 32); // Block align
-            System.BitConverter.GetBytes((short)16).CopyTo(wav, 34); // Bits per sample
+            BitConverter.GetBytes(16).CopyTo(wav, 16);
+            BitConverter.GetBytes((short)1).CopyTo(wav, 20);  // PCM
+            BitConverter.GetBytes((short)1).CopyTo(wav, 22);  // Mono
+            BitConverter.GetBytes(sampleRate).CopyTo(wav, 24);
+            BitConverter.GetBytes(sampleRate * 2).CopyTo(wav, 28);
+            BitConverter.GetBytes((short)2).CopyTo(wav, 32);
+            BitConverter.GetBytes((short)16).CopyTo(wav, 34);
             System.Text.Encoding.ASCII.GetBytes("data").CopyTo(wav, 36);
-            System.BitConverter.GetBytes(samples.Length * 2).CopyTo(wav, 40);
+            BitConverter.GetBytes(samples.Length * 2).CopyTo(wav, 40);
 
             for (int i = 0; i < samples.Length; i++)
             {
-                short val = (short)(Mathf.Clamp(samples[i], -1f, 1f) * 32767);
-                System.BitConverter.GetBytes(val).CopyTo(wav, 44 + i * 2);
+                short value = (short)(Mathf.Clamp(samples[i], -1f, 1f) * 32767f);
+                BitConverter.GetBytes(value).CopyTo(wav, 44 + i * 2);
             }
 
             File.WriteAllBytes(path, wav);
+            AssetDatabase.ImportAsset(path, ImportAssetOptions.ForceUpdate);
+            return AssetDatabase.LoadAssetAtPath<AudioClip>(path);
         }
+
         #endregion
 
-        #region Projectile Prefabs
-        private static Dictionary<TowerType, GameObject> CreateProjectiles(Dictionary<string, Material> mats)
+        #region Efectos visuales
+
+        private static void CreateVfxPrefabs()
         {
-            var dict = new Dictionary<TowerType, GameObject>();
+            vfx = new Dictionary<string, GameObject>();
 
-            GameObject CreateProj(string name, TowerType type, Material mat, PrimitiveType prim, Vector3 scale, float spd, float dmg, float splash = 0f, float knock = 0f, float slow = 1f, float slowDur = 0f)
+            void Create(string name, PrimitiveType shape, Vector3 start, Vector3 end, float duration, Color color)
             {
-                string path = $"{PREFABS_PATH}/Projectiles/{name}.prefab";
-                GameObject go = GameObject.CreatePrimitive(prim);
-                go.name = name;
-                go.transform.localScale = scale;
-                go.GetComponent<MeshRenderer>().sharedMaterial = mat;
-
-                Collider col = go.GetComponent<Collider>();
-                col.isTrigger = true;
-
-                Rigidbody rb = go.AddComponent<Rigidbody>();
-                rb.useGravity = false;
-                rb.isKinematic = true;
-
-                Projectile proj = go.AddComponent<Projectile>();
-                // Initialize default parameters
-                proj.Initialize(null, dmg, spd - 6f, splash, knock, slow, slowDur);
-
-                GameObject prefab = PrefabUtility.SaveAsPrefabAsset(go, path);
-                GameObject.DestroyImmediate(go);
-                dict[type] = prefab;
-                return prefab;
+                var root = new GameObject(name);
+                Prim(shape, "Mesh", root.transform, Vector3.zero, Vector3.one, mats["Mat_Fx"]);
+                PulseEffect effect = root.AddComponent<PulseEffect>();
+                SetProps(effect, ("duration", duration), ("startScale", start), ("endScale", end), ("color", color));
+                vfx[name] = SavePrefab(root, $"{PrefabsPath}/VFX/{name}.prefab");
             }
 
-            CreateProj("Projectile_Bass", TowerType.Bass, mats["Mat_NeonCyan"], PrimitiveType.Sphere, Vector3.one * 0.12f, 8f, 30f);
-            CreateProj("Projectile_Treble", TowerType.Treble, mats["Mat_NeonYellow"], PrimitiveType.Sphere, Vector3.one * 0.08f, 14f, 15f);
-            CreateProj("Projectile_Echo", TowerType.Echo, mats["Mat_NeonMagenta"], PrimitiveType.Cylinder, new Vector3(0.18f, 0.03f, 0.18f), 7f, 20f, 0.65f, 0f, 0.4f, 2.5f);
-            CreateProj("Projectile_Drop", TowerType.Drop, mats["Mat_NeonPurple"], PrimitiveType.Cube, Vector3.one * 0.15f, 7f, 45f, 0.6f, 12f);
+            Vector3 Disc(float diameter) => new Vector3(diameter, 0.004f, diameter);
 
-            return dict;
+            Create("Vfx_CyanFlash", PrimitiveType.Sphere, Vector3.one * 0.05f, Vector3.one * 0.34f, 0.45f, new Color(0.2f, 1f, 1f, 0.85f));
+            Create("Vfx_Shot", PrimitiveType.Sphere, Vector3.one * 0.03f, Vector3.one * 0.12f, 0.2f, new Color(1f, 1f, 1f, 0.6f));
+            Create("Vfx_Impact", PrimitiveType.Sphere, Vector3.one * 0.03f, Vector3.one * 0.11f, 0.22f, new Color(0.3f, 1f, 0.95f, 0.8f));
+            Create("Vfx_Death", PrimitiveType.Cube, Vector3.one * 0.06f, Vector3.one * 0.2f, 0.35f, new Color(1f, 0.15f, 0.2f, 0.85f));
+            Create("Vfx_MagentaPulse", PrimitiveType.Cylinder, Disc(0.1f), Disc(1f), 0.6f, new Color(1f, 0.15f, 0.6f, 0.6f));
+            Create("Vfx_MoveMarker", PrimitiveType.Cylinder, Disc(0.14f), Disc(0.03f), 0.5f, new Color(0.2f, 1f, 1f, 0.8f));
         }
+
         #endregion
 
-        #region Tower Prefabs
-        private static Dictionary<TowerType, GameObject> CreateTowers(Dictionary<string, Material> mats, Dictionary<TowerType, GameObject> projs)
+        #region Barras de vida (World Space)
+
+        private static GameObject CreateHealthBarPrefab(string name, Vector2 size, bool withLabel)
         {
-            var dict = new Dictionary<TowerType, GameObject>();
+            var root = new GameObject(name, typeof(RectTransform));
+            var canvas = root.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.WorldSpace;
+            var rootRT = (RectTransform)root.transform;
+            rootRT.sizeDelta = size;
+            rootRT.localScale = Vector3.one * 0.0012f;
 
-            GameObject CreateTower(TowerType type, string name, int cost, Material accentMat, GameObject projPrefab, TowerStats[] stats)
+            RectTransform bg = UIRect("Background", root.transform, Vector2.zero, Vector2.one, new Vector2(0.5f, 0.5f), Vector2.zero, Vector2.zero);
+            UIImage(bg, new Color(0.02f, 0.02f, 0.05f, 0.85f), null, false);
+
+            RectTransform area = UIRect("FillArea", root.transform, Vector2.zero, Vector2.one, new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(-4f, -4f));
+            RectTransform fill = UIRect("Fill", area, Vector2.zero, Vector2.one, new Vector2(0.5f, 0.5f), Vector2.zero, Vector2.zero);
+            UIImage(fill, withLabel ? Magenta : GlitchRed, null, false);
+
+            TextMeshProUGUI label = null;
+            if (withLabel)
             {
-                string path = $"{PREFABS_PATH}/Towers/{name}.prefab";
-                GameObject root = new GameObject(name);
-                root.tag = "Tower";
+                RectTransform labelRT = UIRect("Name", root.transform, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 0f), new Vector2(0f, 2f), new Vector2(60f, 26f));
+                label = UIText(labelRT, "Jefe", 20f, White, TextAlignmentOptions.Center);
+            }
 
-                // Base física
-                BoxCollider boxCol = root.AddComponent<BoxCollider>();
-                boxCol.size = new Vector3(0.25f, 0.4f, 0.25f);
-                boxCol.center = new Vector3(0f, 0.2f, 0f);
+            UIFollow follow = root.AddComponent<UIFollow>();
+            SetProps(follow, ("destroyWithTarget", true), ("keepConstantScreenSize", false), ("lockYAxisOnly", false));
 
-                // Malla de pedestal
-                GameObject pedestal = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-                pedestal.name = "Pedestal";
-                pedestal.transform.SetParent(root.transform);
-                pedestal.transform.localPosition = new Vector3(0f, 0.06f, 0f);
-                pedestal.transform.localScale = new Vector3(0.22f, 0.06f, 0.22f);
-                pedestal.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_DarkStage"];
-                GameObject.DestroyImmediate(pedestal.GetComponent<Collider>());
+            WorldHealthBar bar = root.AddComponent<WorldHealthBar>();
+            SetProps(bar, ("fill", fill), ("nameLabel", label));
 
-                // Cabeza giratoria (RotatorPart)
-                GameObject rotator = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                rotator.name = "RotatorHead";
-                rotator.transform.SetParent(root.transform);
-                rotator.transform.localPosition = new Vector3(0f, 0.22f, 0f);
-                rotator.transform.localScale = new Vector3(0.15f, 0.15f, 0.2f);
-                rotator.GetComponent<MeshRenderer>().sharedMaterial = accentMat;
-                GameObject.DestroyImmediate(rotator.GetComponent<Collider>());
+            return SavePrefab(root, $"{PrefabsPath}/UI/{name}.prefab");
+        }
 
-                // Cañón / Speaker cone
-                GameObject speaker = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-                speaker.name = "SpeakerCone";
-                speaker.transform.SetParent(rotator.transform);
-                speaker.transform.localPosition = new Vector3(0f, 0f, 0.55f);
-                speaker.transform.localRotation = Quaternion.Euler(90f, 0f, 0f);
-                speaker.transform.localScale = new Vector3(0.6f, 0.25f, 0.6f);
-                speaker.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_WhiteMetal"];
-                GameObject.DestroyImmediate(speaker.GetComponent<Collider>());
+        #endregion
 
-                // Fire Point
-                GameObject firePointObj = new GameObject("FirePoint");
-                firePointObj.transform.SetParent(rotator.transform);
-                firePointObj.transform.localPosition = new Vector3(0f, 0f, 0.8f);
+        #region Personajes
 
-                // Range visualizer disc
-                GameObject rangeVis = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-                rangeVis.name = "RangeVisualizer";
-                rangeVis.transform.SetParent(root.transform);
-                rangeVis.transform.localPosition = new Vector3(0f, 0.01f, 0f);
-                rangeVis.transform.localScale = new Vector3(2.4f, 0.002f, 2.4f);
-                rangeVis.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_BuildSpotNormal"];
-                GameObject.DestroyImmediate(rangeVis.GetComponent<Collider>());
-                rangeVis.SetActive(false);
+        /// <summary>
+        /// Cantante chibi original hecha con primitivas: coletas largas y micrófono (GDD 1, nota de contenido).
+        /// Altura aproximada 1 unidad antes de aplicar <paramref name="scale"/>; mira hacia +Z.
+        /// </summary>
+        private static Transform BuildChibi(Transform parent, string name, Material hair, Material dress, Material accent, float scale)
+        {
+            Transform root = Empty(name, parent, Vector3.zero).transform;
+            root.localScale = Vector3.one * scale;
 
-                // Silence Indicator
-                GameObject silenceInd = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                silenceInd.name = "SilenceIndicator";
-                silenceInd.transform.SetParent(root.transform);
-                silenceInd.transform.localPosition = new Vector3(0f, 0.38f, 0f);
-                silenceInd.transform.localScale = Vector3.one * 0.08f;
-                silenceInd.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonMagenta"];
-                GameObject.DestroyImmediate(silenceInd.GetComponent<Collider>());
-                silenceInd.SetActive(false);
+            Prim(PrimitiveType.Capsule, "Body", root, new Vector3(0f, 0.3f, 0f), new Vector3(0.32f, 0.28f, 0.32f), dress);
+            Prim(PrimitiveType.Cylinder, "Skirt", root, new Vector3(0f, 0.2f, 0f), new Vector3(0.5f, 0.05f, 0.5f), accent);
+            Prim(PrimitiveType.Sphere, "Head", root, new Vector3(0f, 0.74f, 0f), Vector3.one * 0.44f, mats["Mat_Skin"]);
+            Prim(PrimitiveType.Sphere, "Hair", root, new Vector3(0f, 0.8f, -0.06f), Vector3.one * 0.47f, hair);
+            Prim(PrimitiveType.Capsule, "TwinTail_L", root, new Vector3(-0.3f, 0.45f, -0.08f), new Vector3(0.11f, 0.36f, 0.11f), hair, new Vector3(0f, 0f, -14f));
+            Prim(PrimitiveType.Capsule, "TwinTail_R", root, new Vector3(0.3f, 0.45f, -0.08f), new Vector3(0.11f, 0.36f, 0.11f), hair, new Vector3(0f, 0f, 14f));
+            Prim(PrimitiveType.Sphere, "Eye_L", root, new Vector3(-0.09f, 0.74f, 0.19f), Vector3.one * 0.07f, mats["Mat_Ink"]);
+            Prim(PrimitiveType.Sphere, "Eye_R", root, new Vector3(0.09f, 0.74f, 0.19f), Vector3.one * 0.07f, mats["Mat_Ink"]);
+            Prim(PrimitiveType.Cylinder, "Mic", root, new Vector3(0.2f, 0.48f, 0.2f), new Vector3(0.05f, 0.08f, 0.05f), mats["Mat_Ink"], new Vector3(25f, 0f, -15f));
+            Prim(PrimitiveType.Sphere, "MicHead", root, new Vector3(0.23f, 0.57f, 0.24f), Vector3.one * 0.09f, mats["Mat_White"]);
+            return root;
+        }
 
-                // Componente Tower
-                Tower tower = root.AddComponent<Tower>();
-                var so = new SerializedObject(tower);
-                so.FindProperty("towerType").enumValueIndex = (int)type;
-                so.FindProperty("towerName").stringValue = name;
-                so.FindProperty("baseCost").intValue = cost;
-                so.FindProperty("projectilePrefab").objectReferenceValue = projPrefab;
-                so.FindProperty("firePoint").objectReferenceValue = firePointObj.transform;
-                so.FindProperty("rotatorPart").objectReferenceValue = rotator.transform;
-                so.FindProperty("rangeVisualizer").objectReferenceValue = rangeVis;
-                so.FindProperty("silenceIndicator").objectReferenceValue = silenceInd;
+        private static GameObject CreateAvatarPrefab()
+        {
+            var root = new GameObject("Avatar_Hero") { tag = "Avatar" };
+            var col = root.AddComponent<CapsuleCollider>();
+            col.radius = 0.05f;
+            col.height = 0.22f;
+            col.center = new Vector3(0f, 0.11f, 0f);
 
-                var statsArr = so.FindProperty("statsPerLevel");
-                statsArr.arraySize = 3;
-                for (int i = 0; i < 3; i++)
+            Transform visual = Empty("Visual", root.transform, Vector3.zero).transform;
+            BuildChibi(visual, "Heroine", mats["Mat_Turquoise"], mats["Mat_Ink"], mats["Mat_Magenta"], 0.22f);
+
+            // Aro a los pies para distinguirla de las torres
+            Prim(PrimitiveType.Cylinder, "FootRing", root.transform, new Vector3(0f, 0.004f, 0f), new Vector3(0.13f, 0.002f, 0.13f), mats["Mat_Hologram"]);
+
+            AvatarController avatar = root.AddComponent<AvatarController>();
+            SetProps(avatar,
+                ("moveSpeed", 0.6f), ("fieldHalfSize", 0.78f), ("tuneProximity", 0.35f),
+                ("teleportVfxPrefab", vfx["Vfx_CyanFlash"]), ("moveIndicatorPrefab", vfx["Vfx_MoveMarker"]), ("visualRoot", visual));
+
+            return SavePrefab(root, $"{PrefabsPath}/Environment/Avatar_Hero.prefab");
+        }
+
+        private static GameObject CreateReticlePrefab()
+        {
+            var root = new GameObject("PlacementReticle");
+            PlacementReticle reticle = root.AddComponent<PlacementReticle>();
+            SetProps(reticle, ("ringMaterial", mats["Mat_Reticle"]), ("outerRadius", 0.5f));
+            return SavePrefab(root, $"{PrefabsPath}/Environment/PlacementReticle.prefab");
+        }
+
+        #endregion
+
+        #region Proyectiles y torres
+
+        private static GameObject CreateProjectile(string name, Action<Transform> buildVisual, float speed, float splash, float knockback, float slow, float slowDuration)
+        {
+            var root = new GameObject(name);
+            var col = root.AddComponent<SphereCollider>();
+            col.radius = 0.04f;
+            col.isTrigger = true;
+
+            var rb = root.AddComponent<Rigidbody>();
+            rb.useGravity = false;
+            rb.isKinematic = false;
+            rb.constraints = RigidbodyConstraints.FreezeRotation;
+
+            buildVisual(root.transform);
+
+            Projectile projectile = root.AddComponent<Projectile>();
+            SetProps(projectile,
+                ("speed", speed), ("splashRadius", splash), ("knockbackForce", knockback),
+                ("slowFactor", slow), ("slowDuration", slowDuration), ("impactVfxPrefab", vfx["Vfx_Impact"]));
+
+            return SavePrefab(root, $"{PrefabsPath}/Projectiles/{name}.prefab");
+        }
+
+        private static TowerDef[] CreateTowers()
+        {
+            // Proyectiles: onda de bajos, puerro (guiño visual), pulso de eco y bloque de "drop"
+            GameObject bassProj = CreateProjectile("Projectile_Bass",
+                t => Prim(PrimitiveType.Sphere, "Wave", t, Vector3.zero, Vector3.one * 0.07f, mats["Mat_Turquoise"]),
+                2.2f, 0.1f, 0f, 1f, 0f);
+
+            GameObject trebleProj = CreateProjectile("Projectile_Treble",
+                t =>
                 {
-                    var elem = statsArr.GetArrayElementAtIndex(i);
-                    elem.FindPropertyRelative("damage").floatValue = stats[i].damage;
-                    elem.FindPropertyRelative("range").floatValue = stats[i].range;
-                    elem.FindPropertyRelative("fireRate").floatValue = stats[i].fireRate;
-                    elem.FindPropertyRelative("upgradeCost").intValue = stats[i].upgradeCost;
+                    Prim(PrimitiveType.Capsule, "LeekStalk", t, new Vector3(0f, 0f, -0.012f), new Vector3(0.018f, 0.03f, 0.018f), mats["Mat_LeekGreen"], new Vector3(90f, 0f, 0f));
+                    Prim(PrimitiveType.Capsule, "LeekBulb", t, new Vector3(0f, 0f, 0.03f), new Vector3(0.02f, 0.018f, 0.02f), mats["Mat_White"], new Vector3(90f, 0f, 0f));
+                },
+                3.4f, 0f, 0f, 1f, 0f);
+
+            GameObject echoProj = CreateProjectile("Projectile_Echo",
+                t => Prim(PrimitiveType.Cylinder, "Pulse", t, Vector3.zero, new Vector3(0.11f, 0.008f, 0.11f), mats["Mat_IceCyan"], new Vector3(90f, 0f, 0f)),
+                2.2f, 0.22f, 0f, 0.5f, 1.8f);
+
+            GameObject dropProj = CreateProjectile("Projectile_Drop",
+                t =>
+                {
+                    Prim(PrimitiveType.Cube, "Block", t, Vector3.zero, Vector3.one * 0.07f, mats["Mat_White"], new Vector3(35f, 45f, 0f));
+                    Prim(PrimitiveType.Cube, "Core", t, Vector3.zero, Vector3.one * 0.045f, mats["Mat_Turquoise"]);
+                },
+                2f, 0.25f, 1.6f, 1f, 0f);
+
+            var defs = new[]
+            {
+                new TowerDef
+                {
+                    type = TowerType.Bass, name = "Bass", description = "Onda potente\ncadencia lenta", cost = 50, halfBeats = 4,
+                    hair = Turquoise, dress = Ink, accent = Turquoise, projectile = bassProj,
+                    stats = new[]
+                    {
+                        new TowerStats { damage = 34f, range = 0.50f, upgradeCost = 60 },
+                        new TowerStats { damage = 52f, range = 0.58f, upgradeCost = 90 },
+                        new TowerStats { damage = 80f, range = 0.68f, upgradeCost = 0 }
+                    }
+                },
+                new TowerDef
+                {
+                    type = TowerType.Treble, name = "Treble", description = "Notas rápidas\ndaño bajo", cost = 40, halfBeats = 1,
+                    hair = Magenta, dress = White, accent = Magenta, projectile = trebleProj,
+                    stats = new[]
+                    {
+                        new TowerStats { damage = 7f, range = 0.42f, upgradeCost = 50 },
+                        new TowerStats { damage = 11f, range = 0.50f, upgradeCost = 80 },
+                        new TowerStats { damage = 16f, range = 0.58f, upgradeCost = 0 }
+                    }
+                },
+                new TowerDef
+                {
+                    type = TowerType.Echo, name = "Echo", description = "Pulso en área\nralentiza", cost = 60, halfBeats = 4,
+                    hair = IceCyan, dress = White, accent = IceCyan, projectile = echoProj,
+                    stats = new[]
+                    {
+                        new TowerStats { damage = 12f, range = 0.45f, upgradeCost = 70 },
+                        new TowerStats { damage = 20f, range = 0.52f, upgradeCost = 100 },
+                        new TowerStats { damage = 30f, range = 0.60f, upgradeCost = 0 }
+                    }
+                },
+                new TowerDef
+                {
+                    type = TowerType.Drop, name = "Drop", description = "Explosión\nque empuja", cost = 80, halfBeats = 6,
+                    hair = White, dress = Turquoise, accent = White, projectile = dropProj,
+                    stats = new[]
+                    {
+                        new TowerStats { damage = 45f, range = 0.42f, upgradeCost = 90 },
+                        new TowerStats { damage = 70f, range = 0.50f, upgradeCost = 130 },
+                        new TowerStats { damage = 105f, range = 0.58f, upgradeCost = 0 }
+                    }
                 }
-                so.ApplyModifiedPropertiesWithoutUndo();
+            };
 
-                GameObject prefab = PrefabUtility.SaveAsPrefabAsset(root, path);
-                GameObject.DestroyImmediate(root);
-                dict[type] = prefab;
-                return prefab;
+            for (int i = 0; i < defs.Length; i++)
+            {
+                defs[i].prefab = CreateTowerPrefab(defs[i]);
             }
-
-            // Bass (50)
-            dict[TowerType.Bass] = CreateTower(TowerType.Bass, "Tower_Bass", 50, mats["Mat_NeonCyan"], projs[TowerType.Bass],
-                new TowerStats[] {
-                    new TowerStats { damage = 30f, range = 1.2f, fireRate = 1.0f, upgradeCost = 60 },
-                    new TowerStats { damage = 50f, range = 1.5f, fireRate = 1.2f, upgradeCost = 90 },
-                    new TowerStats { damage = 85f, range = 1.8f, fireRate = 1.5f, upgradeCost = 0 }
-                });
-
-            // Treble (40)
-            dict[TowerType.Treble] = CreateTower(TowerType.Treble, "Tower_Treble", 40, mats["Mat_NeonYellow"], projs[TowerType.Treble],
-                new TowerStats[] {
-                    new TowerStats { damage = 15f, range = 1.5f, fireRate = 2.5f, upgradeCost = 50 },
-                    new TowerStats { damage = 25f, range = 1.8f, fireRate = 3.0f, upgradeCost = 80 },
-                    new TowerStats { damage = 45f, range = 2.2f, fireRate = 4.0f, upgradeCost = 0 }
-                });
-
-            // Echo (60)
-            dict[TowerType.Echo] = CreateTower(TowerType.Echo, "Tower_Echo", 60, mats["Mat_NeonMagenta"], projs[TowerType.Echo],
-                new TowerStats[] {
-                    new TowerStats { damage = 20f, range = 1.3f, fireRate = 0.8f, upgradeCost = 70 },
-                    new TowerStats { damage = 35f, range = 1.6f, fireRate = 1.0f, upgradeCost = 100 },
-                    new TowerStats { damage = 60f, range = 2.0f, fireRate = 1.3f, upgradeCost = 0 }
-                });
-
-            // Drop (80)
-            dict[TowerType.Drop] = CreateTower(TowerType.Drop, "Tower_Drop", 80, mats["Mat_NeonPurple"], projs[TowerType.Drop],
-                new TowerStats[] {
-                    new TowerStats { damage = 45f, range = 1.0f, fireRate = 0.7f, upgradeCost = 90 },
-                    new TowerStats { damage = 75f, range = 1.3f, fireRate = 0.9f, upgradeCost = 130 },
-                    new TowerStats { damage = 120f, range = 1.6f, fireRate = 1.2f, upgradeCost = 0 }
-                });
-
-            return dict;
+            return defs;
         }
+
+        private static Material ColorMat(Color color)
+        {
+            if (color == Turquoise) return mats["Mat_Turquoise"];
+            if (color == Magenta) return mats["Mat_Magenta"];
+            if (color == IceCyan) return mats["Mat_IceCyan"];
+            if (color == White) return mats["Mat_White"];
+            return mats["Mat_Ink"];
+        }
+
+        private static GameObject CreateTowerPrefab(TowerDef def)
+        {
+            var root = new GameObject($"Tower_{def.name}") { tag = "Tower" };
+            var col = root.AddComponent<BoxCollider>();
+            col.size = new Vector3(0.18f, 0.3f, 0.18f);
+            col.center = new Vector3(0f, 0.15f, 0f);
+
+            // Altavoz que sirve de pedestal
+            Prim(PrimitiveType.Cube, "Speaker", root.transform, new Vector3(0f, 0.04f, 0f), new Vector3(0.16f, 0.08f, 0.16f), mats["Mat_Ink"]);
+            Prim(PrimitiveType.Cylinder, "SpeakerCone", root.transform, new Vector3(0f, 0.04f, 0.081f), new Vector3(0.09f, 0.003f, 0.09f), ColorMat(def.accent), new Vector3(90f, 0f, 0f));
+            Prim(PrimitiveType.Cube, "Trim", root.transform, new Vector3(0f, 0.082f, 0f), new Vector3(0.17f, 0.006f, 0.17f), ColorMat(def.accent));
+
+            // Cantante: es la parte que gira hacia el objetivo
+            Transform singer = Empty("Singer", root.transform, new Vector3(0f, 0.085f, 0f)).transform;
+            BuildChibi(singer, "Chibi", ColorMat(def.hair), ColorMat(def.dress), ColorMat(def.accent), 0.17f);
+            Transform firePoint = Empty("FirePoint", singer, new Vector3(0f, 0.1f, 0.07f)).transform;
+
+            GameObject range = Prim(PrimitiveType.Cylinder, "RangeVisualizer", root.transform, new Vector3(0f, 0.006f, 0f), new Vector3(1f, 0.0015f, 1f), mats["Mat_Range"]);
+            range.SetActive(false);
+
+            // Aviso de "silenciada": una X magenta sobre la cantante
+            GameObject silence = Empty("SilenceIndicator", root.transform, new Vector3(0f, 0.32f, 0f));
+            Prim(PrimitiveType.Cube, "Bar1", silence.transform, Vector3.zero, new Vector3(0.1f, 0.018f, 0.018f), mats["Mat_Magenta"], new Vector3(0f, 0f, 45f));
+            Prim(PrimitiveType.Cube, "Bar2", silence.transform, Vector3.zero, new Vector3(0.1f, 0.018f, 0.018f), mats["Mat_Magenta"], new Vector3(0f, 0f, -45f));
+            silence.SetActive(false);
+
+            GameObject lightObj = Empty("NightLight", root.transform, new Vector3(0f, 0.22f, 0f));
+            var light = lightObj.AddComponent<Light>();
+            light.type = LightType.Point;
+            light.color = def.accent == White ? Turquoise : def.accent;
+            light.range = 0.5f;
+            light.intensity = 1.2f;
+            light.enabled = false;
+
+            Tower tower = root.AddComponent<Tower>();
+            SetProps(tower,
+                ("towerType", def.type), ("towerName", def.name), ("baseCost", def.cost), ("halfBeatsPerShot", def.halfBeats),
+                ("projectilePrefab", def.projectile), ("firePoint", firePoint), ("rotatorPart", singer),
+                ("shotVfxPrefab", vfx["Vfx_Shot"]), ("rangeVisualizer", range), ("silenceIndicator", silence), ("nightLight", light));
+
+            var so = new SerializedObject(tower);
+            SerializedProperty stats = so.FindProperty("statsPerLevel");
+            stats.arraySize = def.stats.Length;
+            for (int i = 0; i < def.stats.Length; i++)
+            {
+                SerializedProperty element = stats.GetArrayElementAtIndex(i);
+                element.FindPropertyRelative("damage").floatValue = def.stats[i].damage;
+                element.FindPropertyRelative("range").floatValue = def.stats[i].range;
+                element.FindPropertyRelative("upgradeCost").intValue = def.stats[i].upgradeCost;
+            }
+            so.ApplyModifiedPropertiesWithoutUndo();
+
+            return SavePrefab(root, $"{PrefabsPath}/Towers/Tower_{def.name}.prefab");
+        }
+
         #endregion
 
-        #region Enemies & Bosses Prefabs
-        private static Dictionary<string, GameObject> CreateEnemiesAndBosses(Dictionary<string, Material> mats, AudioClip sfxFeedback)
+        #region Enemigos y jefes
+
+        private static GameObject NewEnemyRoot(string name, Vector3 colliderSize)
+        {
+            var root = new GameObject(name) { tag = "Enemy" };
+            var col = root.AddComponent<BoxCollider>();
+            col.size = colliderSize;
+
+            var rb = root.AddComponent<Rigidbody>();
+            rb.useGravity = false;
+            rb.isKinematic = true;
+            rb.linearDamping = 5f;
+            rb.constraints = RigidbodyConstraints.FreezeRotation | RigidbodyConstraints.FreezePositionY;
+            return root;
+        }
+
+        private static void SetEnemyProps(Enemy enemy, string glitchName, float health, float speed, int coins, int stageDamage,
+            float hover, float knockbackResistance, GameObject healthBar, float barHeight)
+        {
+            SetProps(enemy,
+                ("glitchName", glitchName), ("maxHealth", health), ("moveSpeed", speed), ("coinsReward", coins),
+                ("stageDamage", stageDamage), ("hoverHeight", hover), ("knockbackResistance", knockbackResistance),
+                ("deathVfxPrefab", vfx["Vfx_Death"]), ("healthBarPrefab", healthBar), ("healthBarHeight", barHeight));
+        }
+
+        private static Dictionary<string, GameObject> CreateEnemies(GameObject enemyBar, GameObject bossBar)
         {
             var dict = new Dictionary<string, GameObject>();
+            Material red = mats["Mat_GlitchRed"];
+            Material black = mats["Mat_GlitchBlack"];
 
-            // NoiseZone Prefab
-            GameObject nzObj = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            nzObj.name = "NoiseZone";
-            nzObj.transform.localScale = new Vector3(1.2f, 0.02f, 1.2f);
-            nzObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NoiseZone"];
-            var nzCol = nzObj.GetComponent<Collider>();
-            nzCol.isTrigger = true;
-            nzObj.AddComponent<NoiseZone>();
-            GameObject nzPrefab = PrefabUtility.SaveAsPrefabAsset(nzObj, $"{PREFABS_PATH}/Enemies/NoiseZone.prefab");
-            GameObject.DestroyImmediate(nzObj);
-            dict["NoiseZone"] = nzPrefab;
+            // Zona de ruido del jefe Distorsión
+            {
+                var root = new GameObject("NoiseZone");
+                var col = root.AddComponent<SphereCollider>();
+                col.radius = 0.2f;
+                col.isTrigger = true;
+                Prim(PrimitiveType.Cylinder, "Disc", root.transform, Vector3.zero, new Vector3(0.4f, 0.002f, 0.4f), mats["Mat_Noise"]);
+                Prim(PrimitiveType.Cylinder, "Core", root.transform, new Vector3(0f, 0.002f, 0f), new Vector3(0.18f, 0.002f, 0.18f), mats["Mat_Noise"]);
+                root.AddComponent<NoiseZone>();
+                dict["NoiseZone"] = SavePrefab(root, $"{PrefabsPath}/Enemies/NoiseZone.prefab");
+            }
 
-            // 1. Enemy_Pixel
-            GameObject pixelObj = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            pixelObj.name = "Enemy_Pixel";
-            pixelObj.tag = "Enemy";
-            pixelObj.transform.localScale = Vector3.one * 0.16f;
-            pixelObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_EnemyPixel"];
-            Rigidbody rbP = pixelObj.AddComponent<Rigidbody>();
-            rbP.useGravity = false;
-            rbP.isKinematic = true;
-            Enemy ep = pixelObj.AddComponent<Enemy>();
-            var soP = new SerializedObject(ep);
-            soP.FindProperty("glitchName").stringValue = "Pixel";
-            soP.FindProperty("maxHealth").floatValue = 60f;
-            soP.FindProperty("moveSpeed").floatValue = 1.4f;
-            soP.FindProperty("coinsReward").intValue = 10;
-            soP.FindProperty("stageDamage").intValue = 1;
-            soP.ApplyModifiedPropertiesWithoutUndo();
-            GameObject pixelPrefab = PrefabUtility.SaveAsPrefabAsset(pixelObj, $"{PREFABS_PATH}/Enemies/Enemy_Pixel.prefab");
-            GameObject.DestroyImmediate(pixelObj);
-            dict["Enemy_Pixel"] = pixelPrefab;
+            // Pixel: básico (vida baja, velocidad media)
+            {
+                GameObject root = NewEnemyRoot("Enemy_Pixel", Vector3.one * 0.1f);
+                Prim(PrimitiveType.Cube, "Body", root.transform, Vector3.zero, Vector3.one * 0.085f, red);
+                Prim(PrimitiveType.Cube, "Shard1", root.transform, new Vector3(0.04f, 0.04f, 0.02f), Vector3.one * 0.04f, black);
+                Prim(PrimitiveType.Cube, "Shard2", root.transform, new Vector3(-0.045f, -0.02f, -0.03f), Vector3.one * 0.035f, black);
+                SetEnemyProps(root.AddComponent<Enemy>(), "Pixel", 40f, 0.22f, 8, 1, 0.06f, 0f, enemyBar, 0.1f);
+                dict["Enemy_Pixel"] = SavePrefab(root, $"{PrefabsPath}/Enemies/Enemy_Pixel.prefab");
+            }
 
-            // 2. Enemy_Static
-            GameObject staticObj = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            staticObj.name = "Enemy_Static";
-            staticObj.tag = "Enemy";
-            staticObj.transform.localScale = Vector3.one * 0.22f;
-            staticObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_EnemyStatic"];
-            Rigidbody rbS = staticObj.AddComponent<Rigidbody>();
-            rbS.useGravity = false;
-            rbS.isKinematic = true;
-            Enemy es = staticObj.AddComponent<Enemy>();
-            var soS = new SerializedObject(es);
-            soS.FindProperty("glitchName").stringValue = "Static";
-            soS.FindProperty("maxHealth").floatValue = 120f;
-            soS.FindProperty("moveSpeed").floatValue = 1.0f;
-            soS.FindProperty("coinsReward").intValue = 20;
-            soS.FindProperty("stageDamage").intValue = 1;
-            soS.ApplyModifiedPropertiesWithoutUndo();
-            GameObject staticPrefab = PrefabUtility.SaveAsPrefabAsset(staticObj, $"{PREFABS_PATH}/Enemies/Enemy_Static.prefab");
-            GameObject.DestroyImmediate(staticObj);
-            dict["Enemy_Static"] = staticPrefab;
+            // Static: rápido (vida muy baja, velocidad alta)
+            {
+                GameObject root = NewEnemyRoot("Enemy_Static", Vector3.one * 0.09f);
+                Prim(PrimitiveType.Cube, "Bolt1", root.transform, Vector3.zero, new Vector3(0.13f, 0.02f, 0.02f), red, new Vector3(0f, 0f, 35f));
+                Prim(PrimitiveType.Cube, "Bolt2", root.transform, Vector3.zero, new Vector3(0.13f, 0.02f, 0.02f), black, new Vector3(0f, 60f, -35f));
+                Prim(PrimitiveType.Cube, "Bolt3", root.transform, Vector3.zero, new Vector3(0.02f, 0.13f, 0.02f), red, new Vector3(20f, 0f, 0f));
+                SetEnemyProps(root.AddComponent<Enemy>(), "Static", 22f, 0.4f, 6, 1, 0.07f, 0f, enemyBar, 0.11f);
+                dict["Enemy_Static"] = SavePrefab(root, $"{PrefabsPath}/Enemies/Enemy_Static.prefab");
+            }
 
-            // 3. Enemy_Amp
-            GameObject ampObj = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            ampObj.name = "Enemy_Amp";
-            ampObj.tag = "Enemy";
-            ampObj.transform.localScale = new Vector3(0.24f, 0.18f, 0.24f);
-            ampObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_EnemyAmp"];
-            Rigidbody rbA = ampObj.AddComponent<Rigidbody>();
-            rbA.useGravity = false;
-            rbA.isKinematic = true;
-            Enemy ea = ampObj.AddComponent<Enemy>();
-            var soA = new SerializedObject(ea);
-            soA.FindProperty("glitchName").stringValue = "Amp";
-            soA.FindProperty("maxHealth").floatValue = 280f;
-            soA.FindProperty("moveSpeed").floatValue = 0.75f;
-            soA.FindProperty("coinsReward").intValue = 35;
-            soA.FindProperty("stageDamage").intValue = 2;
-            soA.ApplyModifiedPropertiesWithoutUndo();
-            GameObject ampPrefab = PrefabUtility.SaveAsPrefabAsset(ampObj, $"{PREFABS_PATH}/Enemies/Enemy_Amp.prefab");
-            GameObject.DestroyImmediate(ampObj);
-            dict["Enemy_Amp"] = ampPrefab;
+            // Amp: tanque (vida alta, velocidad baja)
+            {
+                GameObject root = NewEnemyRoot("Enemy_Amp", new Vector3(0.15f, 0.14f, 0.12f));
+                Prim(PrimitiveType.Cube, "Cabinet", root.transform, Vector3.zero, new Vector3(0.15f, 0.14f, 0.11f), black);
+                Prim(PrimitiveType.Cylinder, "Cone", root.transform, new Vector3(0f, 0f, 0.056f), new Vector3(0.1f, 0.003f, 0.1f), red, new Vector3(90f, 0f, 0f));
+                Prim(PrimitiveType.Cube, "Knobs", root.transform, new Vector3(0f, 0.075f, 0f), new Vector3(0.12f, 0.012f, 0.03f), red);
+                SetEnemyProps(root.AddComponent<Enemy>(), "Amp", 160f, 0.13f, 20, 1, 0.075f, 0.5f, enemyBar, 0.13f);
+                dict["Enemy_Amp"] = SavePrefab(root, $"{PrefabsPath}/Enemies/Enemy_Amp.prefab");
+            }
 
-            // BOSS 1: Distortion
-            GameObject bdObj = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            bdObj.name = "Boss_Distortion";
-            bdObj.tag = "Enemy";
-            bdObj.transform.localScale = Vector3.one * 0.38f;
-            bdObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_BossDark"];
-            Rigidbody rbBD = bdObj.AddComponent<Rigidbody>();
-            rbBD.useGravity = false;
-            rbBD.isKinematic = true;
-            BossDistortion bDist = bdObj.AddComponent<BossDistortion>();
-            var soBD = new SerializedObject(bDist);
-            soBD.FindProperty("glitchName").stringValue = "Distorsión";
-            soBD.FindProperty("bossTitle").stringValue = "Distorsión - Corruptor de Ondas";
-            soBD.FindProperty("maxHealth").floatValue = 600f;
-            soBD.FindProperty("moveSpeed").floatValue = 0.65f;
-            soBD.FindProperty("coinsReward").intValue = 100;
-            soBD.FindProperty("noiseZonePrefab").objectReferenceValue = nzPrefab;
-            soBD.ApplyModifiedPropertiesWithoutUndo();
-            dict["Boss_Distortion"] = PrefabUtility.SaveAsPrefabAsset(bdObj, $"{PREFABS_PATH}/Bosses/Boss_Distortion.prefab");
-            GameObject.DestroyImmediate(bdObj);
+            // Jefe 1: Distorsión
+            {
+                GameObject root = NewEnemyRoot("Boss_Distortion", Vector3.one * 0.24f);
+                Prim(PrimitiveType.Cube, "Core", root.transform, Vector3.zero, Vector3.one * 0.2f, black, new Vector3(0f, 45f, 0f));
+                Prim(PrimitiveType.Cube, "Slice1", root.transform, new Vector3(0.03f, 0.05f, 0f), new Vector3(0.26f, 0.03f, 0.22f), red);
+                Prim(PrimitiveType.Cube, "Slice2", root.transform, new Vector3(-0.03f, -0.04f, 0f), new Vector3(0.26f, 0.03f, 0.22f), red);
+                BossDistortion boss = root.AddComponent<BossDistortion>();
+                SetEnemyProps(boss, "Distorsión", 700f, 0.085f, 100, 5, 0.13f, 0.85f, bossBar, 0.2f);
+                SetProps(boss, ("bossType", BossType.Distortion), ("bossTitle", "Distorsión"), ("abilityInterval", 5f),
+                    ("abilityVfxPrefab", vfx["Vfx_MagentaPulse"]), ("noiseZonePrefab", dict["NoiseZone"]));
+                dict["Boss_Distortion"] = SavePrefab(root, $"{PrefabsPath}/Bosses/Boss_Distortion.prefab");
+            }
 
-            // BOSS 2: Feedback
-            GameObject bfObj = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            bfObj.name = "Boss_Feedback";
-            bfObj.tag = "Enemy";
-            bfObj.transform.localScale = Vector3.one * 0.42f;
-            bfObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonMagenta"];
-            Rigidbody rbBF = bfObj.AddComponent<Rigidbody>();
-            rbBF.useGravity = false;
-            rbBF.isKinematic = true;
-            BossFeedback bFeed = bfObj.AddComponent<BossFeedback>();
-            var soBF = new SerializedObject(bFeed);
-            soBF.FindProperty("glitchName").stringValue = "Feedback";
-            soBF.FindProperty("bossTitle").stringValue = "Feedback - Acople Acústico";
-            soBF.FindProperty("maxHealth").floatValue = 800f;
-            soBF.FindProperty("moveSpeed").floatValue = 0.75f;
-            soBF.FindProperty("coinsReward").intValue = 140;
-            soBF.FindProperty("silenceRadius").floatValue = 2.0f;
-            soBF.FindProperty("silenceDuration").floatValue = 6.0f;
-            soBF.FindProperty("feedbackSfx").objectReferenceValue = sfxFeedback;
-            soBF.ApplyModifiedPropertiesWithoutUndo();
-            dict["Boss_Feedback"] = PrefabUtility.SaveAsPrefabAsset(bfObj, $"{PREFABS_PATH}/Bosses/Boss_Feedback.prefab");
-            GameObject.DestroyImmediate(bfObj);
+            // Jefe 2: Feedback
+            {
+                GameObject root = NewEnemyRoot("Boss_Feedback", Vector3.one * 0.24f);
+                Prim(PrimitiveType.Sphere, "Core", root.transform, Vector3.zero, Vector3.one * 0.2f, red);
+                Prim(PrimitiveType.Cylinder, "Ring1", root.transform, Vector3.zero, new Vector3(0.3f, 0.006f, 0.3f), black);
+                Prim(PrimitiveType.Cylinder, "Ring2", root.transform, Vector3.zero, new Vector3(0.3f, 0.006f, 0.3f), black, new Vector3(0f, 0f, 90f));
+                BossFeedback boss = root.AddComponent<BossFeedback>();
+                SetEnemyProps(boss, "Feedback", 1000f, 0.1f, 140, 5, 0.15f, 0.85f, bossBar, 0.22f);
+                SetProps(boss, ("bossType", BossType.Feedback), ("bossTitle", "Feedback"), ("abilityInterval", 7f),
+                    ("abilityVfxPrefab", vfx["Vfx_MagentaPulse"]), ("silenceRadius", 0.6f), ("silenceDuration", 12f));
+                dict["Boss_Feedback"] = SavePrefab(root, $"{PrefabsPath}/Bosses/Boss_Feedback.prefab");
+            }
 
-            // BOSS 3: Glitch Queen
-            GameObject bqObj = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            bqObj.name = "Boss_GlitchQueen";
-            bqObj.tag = "Enemy";
-            bqObj.transform.localScale = new Vector3(0.42f, 0.4f, 0.42f);
-            bqObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonCyan"];
-            Rigidbody rbBQ = bqObj.AddComponent<Rigidbody>();
-            rbBQ.useGravity = false;
-            rbBQ.isKinematic = true;
-            BossGlitchQueen bQueen = bqObj.AddComponent<BossGlitchQueen>();
-            var soBQ = new SerializedObject(bQueen);
-            soBQ.FindProperty("glitchName").stringValue = "Reina Glitch";
-            soBQ.FindProperty("bossTitle").stringValue = "Reina Glitch - Reina de Enjambre";
-            soBQ.FindProperty("maxHealth").floatValue = 1000f;
-            soBQ.FindProperty("moveSpeed").floatValue = 0.7f;
-            soBQ.FindProperty("coinsReward").intValue = 180;
-            soBQ.FindProperty("minionPrefab").objectReferenceValue = pixelPrefab;
-            soBQ.ApplyModifiedPropertiesWithoutUndo();
-            dict["Boss_GlitchQueen"] = PrefabUtility.SaveAsPrefabAsset(bqObj, $"{PREFABS_PATH}/Bosses/Boss_GlitchQueen.prefab");
-            GameObject.DestroyImmediate(bqObj);
+            // Jefe 3: Reina Glitch
+            {
+                GameObject root = NewEnemyRoot("Boss_GlitchQueen", new Vector3(0.22f, 0.3f, 0.22f));
+                Prim(PrimitiveType.Cylinder, "Gown", root.transform, new Vector3(0f, -0.05f, 0f), new Vector3(0.22f, 0.09f, 0.22f), black);
+                Prim(PrimitiveType.Cube, "Bust", root.transform, new Vector3(0f, 0.07f, 0f), Vector3.one * 0.12f, red, new Vector3(0f, 45f, 0f));
+                for (int i = 0; i < 5; i++)
+                {
+                    float angle = i / 5f * Mathf.PI * 2f;
+                    Prim(PrimitiveType.Cube, $"Crown{i}", root.transform, new Vector3(Mathf.Cos(angle) * 0.06f, 0.16f, Mathf.Sin(angle) * 0.06f), new Vector3(0.02f, 0.06f, 0.02f), red);
+                }
+                BossGlitchQueen boss = root.AddComponent<BossGlitchQueen>();
+                SetEnemyProps(boss, "Reina Glitch", 1300f, 0.095f, 180, 5, 0.15f, 0.85f, bossBar, 0.26f);
+                SetProps(boss, ("bossType", BossType.GlitchQueen), ("bossTitle", "Reina Glitch"), ("abilityInterval", 8f),
+                    ("abilityVfxPrefab", vfx["Vfx_Death"]), ("minionPrefab", dict["Enemy_Pixel"]), ("minionsPerThreshold", 2), ("minionsOnDeath", 3));
+                dict["Boss_GlitchQueen"] = SavePrefab(root, $"{PrefabsPath}/Bosses/Boss_GlitchQueen.prefab");
+            }
 
-            // BOSS 4: Final Mix
-            GameObject bfmObj = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            bfmObj.name = "Boss_FinalMix";
-            bfmObj.tag = "Enemy";
-            bfmObj.transform.localScale = Vector3.one * 0.5f;
-            bfmObj.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonYellow"];
-            Rigidbody rbBFM = bfmObj.AddComponent<Rigidbody>();
-            rbBFM.useGravity = false;
-            rbBFM.isKinematic = true;
-            BossFinalMix bMix = bfmObj.AddComponent<BossFinalMix>();
-            var soBFM = new SerializedObject(bMix);
-            soBFM.FindProperty("glitchName").stringValue = "Mezcla Final";
-            soBFM.FindProperty("bossTitle").stringValue = "Mezcla Final - Sobrecarga Maestra";
-            soBFM.FindProperty("maxHealth").floatValue = 1500f;
-            soBFM.FindProperty("moveSpeed").floatValue = 0.6f;
-            soBFM.FindProperty("coinsReward").intValue = 250;
-            soBFM.FindProperty("noiseZonePrefab").objectReferenceValue = nzPrefab;
-            soBFM.FindProperty("minionPrefab").objectReferenceValue = pixelPrefab;
-            soBFM.ApplyModifiedPropertiesWithoutUndo();
-            dict["Boss_FinalMix"] = PrefabUtility.SaveAsPrefabAsset(bfmObj, $"{PREFABS_PATH}/Bosses/Boss_FinalMix.prefab");
-            GameObject.DestroyImmediate(bfmObj);
+            // Jefe 4: Mezcla Final
+            {
+                GameObject root = NewEnemyRoot("Boss_FinalMix", new Vector3(0.28f, 0.34f, 0.28f));
+                Prim(PrimitiveType.Cube, "Base", root.transform, new Vector3(0f, -0.08f, 0f), new Vector3(0.28f, 0.14f, 0.24f), black);
+                Prim(PrimitiveType.Sphere, "Core", root.transform, new Vector3(0f, 0.06f, 0f), Vector3.one * 0.18f, red);
+                Prim(PrimitiveType.Cylinder, "Halo", root.transform, new Vector3(0f, 0.06f, 0f), new Vector3(0.32f, 0.006f, 0.32f), black, new Vector3(20f, 0f, 0f));
+                Prim(PrimitiveType.Cube, "Fader1", root.transform, new Vector3(-0.08f, 0f, 0.125f), new Vector3(0.03f, 0.08f, 0.01f), red);
+                Prim(PrimitiveType.Cube, "Fader2", root.transform, new Vector3(0f, -0.02f, 0.125f), new Vector3(0.03f, 0.08f, 0.01f), red);
+                Prim(PrimitiveType.Cube, "Fader3", root.transform, new Vector3(0.08f, -0.04f, 0.125f), new Vector3(0.03f, 0.08f, 0.01f), red);
+                BossFinalMix boss = root.AddComponent<BossFinalMix>();
+                SetEnemyProps(boss, "Mezcla Final", 2200f, 0.08f, 250, 5, 0.17f, 0.9f, bossBar, 0.28f);
+                SetProps(boss, ("bossType", BossType.FinalMix), ("bossTitle", "Mezcla Final"), ("abilityInterval", 6f),
+                    ("abilityVfxPrefab", vfx["Vfx_MagentaPulse"]), ("noiseZonePrefab", dict["NoiseZone"]), ("minionPrefab", dict["Enemy_Pixel"]));
+                dict["Boss_FinalMix"] = SavePrefab(root, $"{PrefabsPath}/Bosses/Boss_FinalMix.prefab");
+            }
 
             return dict;
         }
+
         #endregion
 
-        #region Avatar & Reticle Prefabs
-        private static GameObject CreateAvatarPrefab(Dictionary<string, Material> mats)
+        #region Battlefield
+
+        private static readonly Vector3[] PathPoints =
         {
-            string path = $"{PREFABS_PATH}/Environment/Avatar_Hero.prefab";
-            GameObject root = GameObject.CreatePrimitive(PrimitiveType.Capsule);
-            root.name = "Avatar_Hero";
-            root.tag = "Avatar";
-            root.transform.localScale = new Vector3(0.18f, 0.25f, 0.18f);
-            root.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonCyan"];
+            new Vector3(-0.6f, 0f, -0.78f),
+            new Vector3(-0.6f, 0f, -0.2f),
+            new Vector3(-0.1f, 0f, -0.2f),
+            new Vector3(-0.1f, 0f, 0.35f),
+            new Vector3(0.35f, 0f, 0.35f),
+            new Vector3(0.35f, 0f, -0.1f),
+            new Vector3(0.65f, 0f, -0.1f),
+            new Vector3(0.65f, 0f, 0.5f)
+        };
 
-            // Visor anime
-            GameObject visor = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            visor.name = "Visor";
-            visor.transform.SetParent(root.transform);
-            visor.transform.localPosition = new Vector3(0f, 0.5f, 0.45f);
-            visor.transform.localScale = new Vector3(0.7f, 0.25f, 0.35f);
-            visor.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonMagenta"];
-            GameObject.DestroyImmediate(visor.GetComponent<Collider>());
-
-            AvatarController ac = root.AddComponent<AvatarController>();
-
-            GameObject prefab = PrefabUtility.SaveAsPrefabAsset(root, path);
-            GameObject.DestroyImmediate(root);
-            return prefab;
-        }
-
-        private static GameObject CreateReticlePrefab(Dictionary<string, Material> mats)
+        private static GameObject CreateBattlefieldPrefab(GameObject avatarPrefab)
         {
-            string path = $"{PREFABS_PATH}/Environment/PlacementReticle.prefab";
-            GameObject ring = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            ring.name = "PlacementReticle";
-            ring.transform.localScale = new Vector3(0.8f, 0.005f, 0.8f);
-            ring.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_Reticle"];
-            GameObject.DestroyImmediate(ring.GetComponent<Collider>());
+            var root = new GameObject("Battlefield");
+            Transform rt = root.transform;
 
-            GameObject prefab = PrefabUtility.SaveAsPrefabAsset(ring, path);
-            GameObject.DestroyImmediate(ring);
-            return prefab;
-        }
-        #endregion
-
-        #region Battlefield Prefab
-        private static GameObject CreateBattlefieldPrefab(Dictionary<string, Material> mats, GameObject avatarPrefab, AudioClip sfxTeleport)
-        {
-            string path = $"{PREFABS_PATH}/Environment/Battlefield.prefab";
-            GameObject bfRoot = new GameObject("Battlefield");
-
-            // 1. Suelo Principal
+            // --- Suelo holográfico con cuadrícula luminosa (GDD 8) ---
             GameObject ground = GameObject.CreatePrimitive(PrimitiveType.Cube);
             ground.name = "Ground";
             ground.tag = "Field";
-            ground.transform.SetParent(bfRoot.transform);
+            ground.transform.SetParent(rt, false);
             ground.transform.localPosition = new Vector3(0f, -0.02f, 0f);
-            ground.transform.localScale = new Vector3(1.6f, 0.04f, 1.6f);
-            ground.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_DarkStage"];
+            ground.transform.localScale = new Vector3(1.7f, 0.04f, 1.7f);
+            ground.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_Ground"];
 
-            // 2. Trazado visual del camino
-            Vector3[] pathPoints = new Vector3[] {
-                new Vector3(-0.6f, 0.01f, -0.6f),
-                new Vector3(-0.6f, 0.01f, -0.2f),
-                new Vector3(-0.1f, 0.01f, -0.2f),
-                new Vector3(-0.1f, 0.01f, 0.35f),
-                new Vector3(0.35f, 0.01f, 0.35f),
-                new Vector3(0.35f, 0.01f, -0.1f),
-                new Vector3(0.65f, 0.01f, -0.1f),
-                new Vector3(0.65f, 0.01f, 0.55f)
-            };
-
-            GameObject pathContainer = new GameObject("Path");
-            pathContainer.transform.SetParent(bfRoot.transform);
-
-            for (int i = 0; i < pathPoints.Length; i++)
+            Transform grid = Empty("Grid", rt, Vector3.zero).transform;
+            for (int i = -4; i <= 4; i++)
             {
-                GameObject wp = new GameObject($"Waypoint_{i}");
-                wp.transform.SetParent(pathContainer.transform);
-                wp.transform.localPosition = pathPoints[i];
-
-                // Línea / baldosa visual sobre el camino
-                GameObject tile = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-                tile.name = $"Tile_{i}";
-                tile.transform.SetParent(wp.transform);
-                tile.transform.localPosition = Vector3.zero;
-                tile.transform.localScale = new Vector3(0.25f, 0.005f, 0.25f);
-                tile.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_FieldPath"];
-                GameObject.DestroyImmediate(tile.GetComponent<Collider>());
+                float offset = i * 0.2f;
+                bool edge = Mathf.Abs(i) == 4;
+                float thickness = edge ? 0.012f : 0.005f;
+                Prim(PrimitiveType.Cube, $"LineX{i}", grid, new Vector3(0f, 0.0015f, offset), new Vector3(1.62f, 0.002f, thickness), mats["Mat_Grid"]);
+                Prim(PrimitiveType.Cube, $"LineZ{i}", grid, new Vector3(offset, 0.0015f, 0f), new Vector3(thickness, 0.002f, 1.62f), mats["Mat_Grid"]);
             }
 
-            // Escenario / Meta final (DJ Stage)
-            GameObject stageGoal = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            stageGoal.name = "DJ_Stage_Goal";
-            stageGoal.transform.SetParent(bfRoot.transform);
-            stageGoal.transform.localPosition = new Vector3(0.65f, 0.06f, 0.55f);
-            stageGoal.transform.localScale = new Vector3(0.35f, 0.08f, 0.35f);
-            stageGoal.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonCyan"];
-            GameObject.DestroyImmediate(stageGoal.GetComponent<Collider>());
+            // --- Camino de los glitches ---
+            Transform path = Empty("Path", rt, Vector3.zero).transform;
+            Transform pathVisual = Empty("PathVisual", rt, Vector3.zero).transform;
+            for (int i = 0; i < PathPoints.Length; i++)
+            {
+                Empty($"Waypoint_{i}", path, PathPoints[i]);
+                Prim(PrimitiveType.Cylinder, $"Corner_{i}", pathVisual, PathPoints[i] + Vector3.up * 0.003f, new Vector3(0.13f, 0.002f, 0.13f), mats["Mat_Path"]);
+                if (i > 0)
+                {
+                    Segment($"Strip_{i}", pathVisual, PathPoints[i - 1] + Vector3.up * 0.003f, PathPoints[i] + Vector3.up * 0.003f, 0.13f, 0.004f, mats["Mat_Path"]);
+                }
+            }
+            Prim(PrimitiveType.Cube, "Portal", pathVisual, PathPoints[0] + new Vector3(0f, 0.09f, -0.03f), new Vector3(0.18f, 0.18f, 0.02f), mats["Mat_GlitchRed"]);
+            Prim(PrimitiveType.Cube, "PortalCore", pathVisual, PathPoints[0] + new Vector3(0f, 0.09f, -0.018f), new Vector3(0.13f, 0.13f, 0.02f), mats["Mat_GlitchBlack"]);
 
-            // 3. BuildSpots (Plataformas de Construcción)
-            Vector3[] spotPositions = new Vector3[] {
-                new Vector3(-0.35f, 0.02f, -0.45f),
-                new Vector3(-0.35f, 0.02f, 0.1f),
-                new Vector3(0.12f, 0.02f, 0.1f),
-                new Vector3(0.12f, 0.02f, 0.55f),
-                new Vector3(0.55f, 0.02f, 0.2f)
+            // --- Escenario a defender ---
+            Vector3 stagePos = new Vector3(0.65f, 0f, 0.64f);
+            Transform stage = Empty("Stage", rt, stagePos).transform;
+            Prim(PrimitiveType.Cylinder, "Platform", stage, new Vector3(0f, 0.02f, 0f), new Vector3(0.3f, 0.02f, 0.3f), mats["Mat_Turquoise"]);
+            Prim(PrimitiveType.Cylinder, "PlatformTop", stage, new Vector3(0f, 0.042f, 0f), new Vector3(0.26f, 0.002f, 0.26f), mats["Mat_Ink"]);
+            Prim(PrimitiveType.Cube, "Screen", stage, new Vector3(0f, 0.2f, 0.13f), new Vector3(0.3f, 0.2f, 0.012f), mats["Mat_Hologram"]);
+            Prim(PrimitiveType.Cube, "ScreenFrame", stage, new Vector3(0f, 0.2f, 0.138f), new Vector3(0.32f, 0.22f, 0.006f), mats["Mat_Ink"]);
+            Prim(PrimitiveType.Cube, "Speaker_L", stage, new Vector3(-0.17f, 0.07f, 0.08f), new Vector3(0.06f, 0.14f, 0.06f), mats["Mat_Ink"]);
+            Prim(PrimitiveType.Cube, "Speaker_R", stage, new Vector3(0.17f, 0.07f, 0.08f), new Vector3(0.06f, 0.14f, 0.06f), mats["Mat_Ink"]);
+            Transform idol = BuildChibi(stage, "Idol", mats["Mat_Turquoise"], mats["Mat_White"], mats["Mat_Magenta"], 0.15f);
+            idol.localPosition = new Vector3(0f, 0.044f, 0f);
+            idol.localEulerAngles = new Vector3(0f, 180f, 0f);
+
+            // --- Plataformas de construcción ---
+            Transform spots = Empty("BuildSpots", rt, Vector3.zero).transform;
+            Vector3[] spotPositions =
+            {
+                new Vector3(-0.35f, 0f, -0.48f),
+                new Vector3(-0.38f, 0f, 0.08f),
+                new Vector3(0.12f, 0f, 0.08f),
+                new Vector3(0.12f, 0f, 0.6f),
+                new Vector3(0.5f, 0f, 0.14f),
+                new Vector3(0.6f, 0f, -0.4f)
             };
 
             for (int i = 0; i < spotPositions.Length; i++)
             {
-                GameObject spot = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-                spot.name = $"BuildSpot_{i + 1}";
+                GameObject spot = Empty($"BuildSpot_{i + 1}", spots, spotPositions[i]);
                 spot.tag = "BuildSpot";
-                spot.transform.SetParent(bfRoot.transform);
-                spot.transform.localPosition = spotPositions[i];
-                spot.transform.localScale = new Vector3(0.28f, 0.02f, 0.28f);
-                spot.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_BuildSpotNormal"];
+                var col = spot.AddComponent<BoxCollider>();
+                col.size = new Vector3(0.2f, 0.05f, 0.2f);
+                col.center = new Vector3(0f, 0.025f, 0f);
 
-                BuildSpot bs = spot.AddComponent<BuildSpot>();
-                var soBS = new SerializedObject(bs);
-                soBS.FindProperty("requireAvatarNearby").boolValue = true;
-                soBS.FindProperty("avatarProximityDistance").floatValue = 1.3f;
-                soBS.FindProperty("availableIndicator").objectReferenceValue = spot;
-                soBS.FindProperty("inRangeColor").colorValue = mats["Mat_BuildSpotInRange"].color;
-                soBS.FindProperty("outOfRangeColor").colorValue = mats["Mat_BuildSpotOutOfRange"].color;
-                soBS.ApplyModifiedPropertiesWithoutUndo();
+                Prim(PrimitiveType.Cylinder, "Base", spot.transform, new Vector3(0f, 0.005f, 0f), new Vector3(0.2f, 0.005f, 0.2f), mats["Mat_Ink"]);
+                GameObject indicator = Prim(PrimitiveType.Cylinder, "Indicator", spot.transform, new Vector3(0f, 0.012f, 0f), new Vector3(0.16f, 0.002f, 0.16f), mats["Mat_Indicator"]);
+
+                BuildSpot buildSpot = spot.AddComponent<BuildSpot>();
+                SetProps(buildSpot, ("requireAvatarNearby", true), ("avatarProximityDistance", 0.45f), ("availableIndicator", indicator.GetComponent<MeshRenderer>()));
             }
 
-            // 4. TeleportPads (2 Plataformas conectadas)
-            GameObject padA = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            padA.name = "TeleportPad_A";
-            padA.transform.SetParent(bfRoot.transform);
-            padA.transform.localPosition = new Vector3(-0.55f, 0.02f, 0.55f);
-            padA.transform.localScale = new Vector3(0.24f, 0.015f, 0.24f);
-            padA.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonYellow"];
-
-            GameObject padB = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            padB.name = "TeleportPad_B";
-            padB.transform.SetParent(bfRoot.transform);
-            padB.transform.localPosition = new Vector3(0.55f, 0.02f, -0.55f);
-            padB.transform.localScale = new Vector3(0.24f, 0.015f, 0.24f);
-            padB.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonYellow"];
-
-            TeleportPad tpA = padA.AddComponent<TeleportPad>();
-            TeleportPad tpB = padB.AddComponent<TeleportPad>();
-
-            var soTPA = new SerializedObject(tpA);
-            soTPA.FindProperty("pairedPad").objectReferenceValue = tpB;
-            soTPA.FindProperty("teleportSfx").objectReferenceValue = sfxTeleport;
-            soTPA.ApplyModifiedPropertiesWithoutUndo();
-
-            var soTPB = new SerializedObject(tpB);
-            soTPB.FindProperty("pairedPad").objectReferenceValue = tpA;
-            soTPB.FindProperty("teleportSfx").objectReferenceValue = sfxTeleport;
-            soTPB.ApplyModifiedPropertiesWithoutUndo();
-
-            // 5. Roller Coaster Track & Cart
-            GameObject trackRoot = new GameObject("RollerCoasterTrack");
-            trackRoot.transform.SetParent(bfRoot.transform);
-
-            Vector3[] trackPoints = new Vector3[] {
-                new Vector3(-0.7f, 0.25f, -0.7f),
-                new Vector3(-0.7f, 0.25f, 0.7f),
-                new Vector3(0.7f, 0.25f, 0.7f),
-                new Vector3(0.7f, 0.25f, -0.7f),
-                new Vector3(-0.7f, 0.25f, -0.7f)
+            // --- Pads de teletransporte (dos parejas) ---
+            Transform pads = Empty("TeleportPads", rt, Vector3.zero).transform;
+            Vector3[] padPositions =
+            {
+                new Vector3(-0.62f, 0f, 0.6f),
+                new Vector3(0.1f, 0f, -0.6f),
+                new Vector3(0.42f, 0f, 0.66f),
+                new Vector3(-0.3f, 0f, 0.45f)
             };
 
-            for (int i = 0; i < trackPoints.Length; i++)
+            var padComponents = new TeleportPad[padPositions.Length];
+            for (int i = 0; i < padPositions.Length; i++)
             {
-                GameObject tw = new GameObject($"TrackWP_{i}");
-                tw.transform.SetParent(trackRoot.transform);
-                tw.transform.localPosition = trackPoints[i];
+                GameObject pad = Empty($"TeleportPad_{(char)('A' + i)}", pads, padPositions[i]);
+                pad.tag = "TeleportPad";
+                var col = pad.AddComponent<BoxCollider>();
+                col.size = new Vector3(0.18f, 0.05f, 0.18f);
+                col.center = new Vector3(0f, 0.025f, 0f);
+
+                Prim(PrimitiveType.Cylinder, "Base", pad.transform, new Vector3(0f, 0.005f, 0f), new Vector3(0.18f, 0.005f, 0.18f), mats["Mat_White"]);
+                Prim(PrimitiveType.Cylinder, "Glow", pad.transform, new Vector3(0f, 0.012f, 0f), new Vector3(0.13f, 0.002f, 0.13f), mats["Mat_Hologram"]);
+                Prim(PrimitiveType.Cylinder, "Center", pad.transform, new Vector3(0f, 0.014f, 0f), new Vector3(0.05f, 0.002f, 0.05f), mats["Mat_Magenta"]);
+
+                padComponents[i] = pad.AddComponent<TeleportPad>();
+            }
+            SetProps(padComponents[0], ("pairedPad", padComponents[1]));
+            SetProps(padComponents[1], ("pairedPad", padComponents[0]));
+            SetProps(padComponents[2], ("pairedPad", padComponents[3]));
+            SetProps(padComponents[3], ("pairedPad", padComponents[2]));
+
+            // --- Montaña rusa: baja de una estación elevada, recorre el camino y vuelve a subir ---
+            Transform coaster = Empty("RollerCoaster", rt, Vector3.zero).transform;
+            Transform track = Empty("Track", coaster, Vector3.zero).transform;
+            Transform rails = Empty("Rails", coaster, Vector3.zero).transform;
+
+            const float rideHeight = 0.06f;
+            var trackPoints = new List<Vector3> { new Vector3(-0.84f, 0.42f, -0.84f), new Vector3(-0.6f, rideHeight, -0.7f) };
+            for (int i = 1; i < PathPoints.Length - 1; i++)
+            {
+                trackPoints.Add(PathPoints[i] + Vector3.up * rideHeight);
+            }
+            trackPoints.Add(new Vector3(0.65f, rideHeight, 0.3f));
+            trackPoints.Add(new Vector3(0.84f, 0.42f, -0.1f));
+
+            for (int i = 0; i < trackPoints.Count; i++)
+            {
+                Empty($"TrackWP_{i}", track, trackPoints[i]);
+                if (i == 0) continue;
+
+                Vector3 a = trackPoints[i - 1] - Vector3.up * 0.045f;
+                Vector3 b = trackPoints[i] - Vector3.up * 0.045f;
+                Vector3 side = Vector3.Cross(Vector3.up, (b - a).normalized).normalized * 0.03f;
+                Segment($"RailL_{i}", rails, a - side, b - side, 0.008f, 0.008f, mats["Mat_Magenta"]);
+                Segment($"RailR_{i}", rails, a + side, b + side, 0.008f, 0.008f, mats["Mat_Magenta"]);
             }
 
-            GameObject cart = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            cart.name = "RollerCoasterCart";
-            cart.transform.SetParent(bfRoot.transform);
-            cart.transform.localScale = new Vector3(0.25f, 0.15f, 0.4f);
-            cart.GetComponent<MeshRenderer>().sharedMaterial = mats["Mat_NeonMagenta"];
-            var cartCol = cart.GetComponent<Collider>();
+            // Soportes de los tramos elevados
+            foreach (Vector3 top in new[] { trackPoints[0], Vector3.Lerp(trackPoints[0], trackPoints[1], 0.5f), trackPoints[trackPoints.Count - 1], Vector3.Lerp(trackPoints[trackPoints.Count - 1], trackPoints[trackPoints.Count - 2], 0.5f) })
+            {
+                Vector3 railPoint = top - Vector3.up * 0.045f;
+                Segment("Support", rails, new Vector3(railPoint.x, 0f, railPoint.z), railPoint, 0.012f, 0.012f, mats["Mat_White"]);
+            }
+
+            var cart = new GameObject("Cart");
+            cart.transform.SetParent(coaster, false);
+            cart.transform.localPosition = trackPoints[0];
+            var cartCol = cart.AddComponent<BoxCollider>();
+            cartCol.size = new Vector3(0.14f, 0.1f, 0.2f);
             cartCol.isTrigger = true;
+            var cartRb = cart.AddComponent<Rigidbody>();
+            cartRb.useGravity = false;
+            cartRb.isKinematic = true;
+            Prim(PrimitiveType.Cube, "Body", cart.transform, Vector3.zero, new Vector3(0.12f, 0.06f, 0.18f), mats["Mat_Turquoise"]);
+            Prim(PrimitiveType.Cube, "Nose", cart.transform, new Vector3(0f, 0f, 0.1f), new Vector3(0.1f, 0.05f, 0.05f), mats["Mat_Magenta"], new Vector3(45f, 0f, 0f));
+            Prim(PrimitiveType.Cube, "Seat", cart.transform, new Vector3(0f, 0.04f, -0.04f), new Vector3(0.1f, 0.05f, 0.03f), mats["Mat_Ink"]);
             cart.AddComponent<RollerCoasterCart>();
             cart.SetActive(false);
 
-            // 6. Contenedor de enemigos instanciados
-            GameObject enemiesContainer = new GameObject("EnemiesContainer");
-            enemiesContainer.transform.SetParent(bfRoot.transform);
+            // --- Avatar y contenedores ---
+            GameObject avatar = (GameObject)PrefabUtility.InstantiatePrefab(avatarPrefab, rt);
+            avatar.name = "Avatar";
+            avatar.transform.localPosition = new Vector3(0.12f, 0f, -0.28f);
 
-            // 7. Instanciar Avatar dentro de Battlefield
-            if (avatarPrefab != null)
-            {
-                GameObject avatarInstance = (GameObject)PrefabUtility.InstantiatePrefab(avatarPrefab, bfRoot.transform);
-                avatarInstance.name = "Avatar_Hero";
-                avatarInstance.transform.localPosition = new Vector3(0f, 0.13f, 0f);
-            }
+            Transform towers = Empty("Towers", rt, Vector3.zero).transform;
+            Transform enemies = Empty("Enemies", rt, Vector3.zero).transform;
+            Transform projectiles = Empty("Projectiles", rt, Vector3.zero).transform;
 
-            GameObject prefab = PrefabUtility.SaveAsPrefabAsset(bfRoot, path);
-            GameObject.DestroyImmediate(bfRoot);
-            return prefab;
+            Battlefield battlefield = root.AddComponent<Battlefield>();
+            SetProps(battlefield,
+                ("stage", stage), ("path", path), ("rollerCoasterTrack", track), ("rollerCoasterCart", cart),
+                ("avatar", avatar.transform), ("towers", towers), ("enemies", enemies), ("projectiles", projectiles));
+
+            // Tamaño por defecto: ~1 m de lado, cómodo para una mesa (el jugador puede escalarlo)
+            rt.localScale = Vector3.one * 0.6f;
+
+            return SavePrefab(root, $"{PrefabsPath}/Environment/Battlefield.prefab");
         }
+
         #endregion
 
-        #region Scene Assembly & UI
-        private static void AssembleScene(AudioClip bgmClip, GameObject battlefieldPrefab, GameObject reticlePrefab, Dictionary<TowerType, GameObject> towers, Dictionary<string, GameObject> enemies)
+        #region Escena
+
+        private static void AssembleScene(AudioClip bgm, Dictionary<SfxId, AudioClip> sfxClips, GameObject battlefieldPrefab,
+            GameObject reticlePrefab, TowerDef[] towers, Dictionary<string, GameObject> enemies)
         {
-            // 1. Limpiar o asegurar GameManager y sistemas en SampleScene
-            GameObject managersRoot = GameObject.Find("[GameManagers]");
-            if (managersRoot == null)
+            var scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Single);
+
+            // 1. Quitar los restos del avance anterior (campo guardado en escena, menús duplicados, spawner de la plantilla)
+            string[] purge = { "Battlefield(Clone)", "Battlefield", "Object Spawner", "ConcertDefense_HUD_Canvas", "WorldSpace_TowerMenu", "PlacementReticle", "[GameManagers]", "ARPlacementManager" };
+            var toRemove = new List<GameObject>();
+            foreach (GameObject sceneRoot in scene.GetRootGameObjects())
             {
-                managersRoot = new GameObject("[GameManagers]");
-            }
-
-            // GameManager
-            GameManager gm = managersRoot.GetComponent<GameManager>();
-            if (gm == null) gm = managersRoot.AddComponent<GameManager>();
-
-            // WaveSpawner
-            WaveSpawner ws = managersRoot.GetComponent<WaveSpawner>();
-            if (ws == null) ws = managersRoot.AddComponent<WaveSpawner>();
-            ConfigureWaves(ws, enemies);
-
-            // BeatClock
-            BeatClock bc = managersRoot.GetComponent<BeatClock>();
-            if (bc == null) bc = managersRoot.AddComponent<BeatClock>();
-            AudioSource musicSrc = managersRoot.GetComponent<AudioSource>();
-            if (musicSrc == null) musicSrc = managersRoot.AddComponent<AudioSource>();
-            musicSrc.clip = bgmClip;
-            musicSrc.loop = true;
-            musicSrc.playOnAwake = false;
-
-            var soBC = new SerializedObject(bc);
-            soBC.FindProperty("bpm").floatValue = 120f;
-            soBC.FindProperty("musicSource").objectReferenceValue = musicSrc;
-            soBC.FindProperty("autoStartOnPlaying").boolValue = true;
-            soBC.ApplyModifiedPropertiesWithoutUndo();
-
-            // UltimateController
-            UltimateController uc = managersRoot.GetComponent<UltimateController>();
-            if (uc == null) uc = managersRoot.AddComponent<UltimateController>();
-
-            // 2. AR Placement & Field Manipulator en XR Origin (AR Rig)
-            GameObject arPlacementMgrOld = GameObject.Find("ARPlacementManager");
-            if (arPlacementMgrOld != null) GameObject.DestroyImmediate(arPlacementMgrOld);
-
-            GameObject xrOriginObj = GameObject.Find("XR Origin (AR Rig)");
-            if (xrOriginObj != null)
-            {
-                ARPlacementController arPlacer = xrOriginObj.GetComponent<ARPlacementController>();
-                if (arPlacer == null) arPlacer = xrOriginObj.AddComponent<ARPlacementController>();
-
-                FieldManipulator fieldManip = xrOriginObj.GetComponent<FieldManipulator>();
-                if (fieldManip == null) fieldManip = xrOriginObj.AddComponent<FieldManipulator>();
-
-                LightEstimationController lightEst = xrOriginObj.GetComponent<LightEstimationController>();
-                if (lightEst == null) lightEst = xrOriginObj.AddComponent<LightEstimationController>();
-
-                // Limpiar retículas duplicadas anteriores
-                foreach (var oldReticle in GameObject.FindObjectsByType<GameObject>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+                foreach (Transform t in sceneRoot.GetComponentsInChildren<Transform>(true))
                 {
-                    if (oldReticle.name == "PlacementReticle")
-                    {
-                        GameObject.DestroyImmediate(oldReticle);
-                    }
-                }
-
-                // Instanciar Retícula única
-                GameObject reticleInstance = null;
-                if (reticlePrefab != null)
-                {
-                    reticleInstance = (GameObject)PrefabUtility.InstantiatePrefab(reticlePrefab);
-                    reticleInstance.name = "PlacementReticle";
-                    reticleInstance.SetActive(false);
-                }
-
-                var soAR = new SerializedObject(arPlacer);
-                soAR.FindProperty("battlefieldPrefab").objectReferenceValue = battlefieldPrefab;
-                soAR.FindProperty("raycastManager").objectReferenceValue = xrOriginObj.GetComponent<UnityEngine.XR.ARFoundation.ARRaycastManager>();
-                soAR.FindProperty("planeManager").objectReferenceValue = xrOriginObj.GetComponent<UnityEngine.XR.ARFoundation.ARPlaneManager>();
-                if (reticleInstance != null) soAR.FindProperty("placementReticle").objectReferenceValue = reticleInstance;
-                soAR.ApplyModifiedPropertiesWithoutUndo();
-
-                // Configurar LightEstimationController
-                var camObj = xrOriginObj.transform.Find("Camera Offset/Main Camera");
-                if (camObj != null)
-                {
-                    if (camObj.GetComponent<AudioListener>() == null)
-                    {
-                        camObj.gameObject.AddComponent<AudioListener>();
-                    }
-                    var camMgr = camObj.GetComponent<UnityEngine.XR.ARFoundation.ARCameraManager>();
-                    var dirLight = GameObject.Find("Directional Light")?.GetComponent<Light>();
-                    var soLE = new SerializedObject(lightEst);
-                    if (camMgr != null) soLE.FindProperty("cameraManager").objectReferenceValue = camMgr;
-                    if (dirLight != null) soLE.FindProperty("directionalLight").objectReferenceValue = dirLight;
-                    soLE.ApplyModifiedPropertiesWithoutUndo();
+                    if (purge.Contains(t.name)) toRemove.Add(t.gameObject);
                 }
             }
+            foreach (GameObject go in toRemove)
+            {
+                if (go == null) continue;
+                if (PrefabUtility.IsPartOfPrefabInstance(go) && !PrefabUtility.IsOutermostPrefabInstanceRoot(go)) go.SetActive(false);
+                else UnityEngine.Object.DestroyImmediate(go);
+            }
 
-            // 3. Canvas y HUD Completo
-            BuildUserInterface(towers);
+            // 2. AR Session y XR Origin (de la plantilla AR Mobile)
+            if (FindInScene<ARSession>(scene) == null)
+            {
+                new GameObject("AR Session").AddComponent<ARSession>();
+            }
 
-            EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
-            EditorSceneManager.SaveScene(EditorSceneManager.GetActiveScene());
+            XROrigin origin = FindInScene<XROrigin>(scene);
+            if (origin == null)
+            {
+                Debug.LogError("[ConcertDefense] La escena no tiene XR Origin. Añádelo con GameObject > XR > XR Origin (Mobile AR) y vuelve a ejecutar el montaje.");
+                return;
+            }
+
+            GameObject originObj = origin.gameObject;
+            ARRaycastManager raycastManager = GetOrAdd<ARRaycastManager>(originObj);
+            ARPlaneManager planeManager = GetOrAdd<ARPlaneManager>(originObj);
+
+            Camera cam = originObj.GetComponentInChildren<Camera>(true);
+            if (cam != null)
+            {
+                cam.gameObject.tag = "MainCamera";
+                GetOrAdd<AudioListener>(cam.gameObject);
+                cam.nearClipPlane = 0.05f;
+            }
+            ARCameraManager cameraManager = originObj.GetComponentInChildren<ARCameraManager>(true);
+
+            // 3. Retícula
+            GameObject reticleObj = (GameObject)PrefabUtility.InstantiatePrefab(reticlePrefab);
+            reticleObj.name = "PlacementReticle";
+
+            ARPlacementController placer = GetOrAdd<ARPlacementController>(originObj);
+            SetProps(placer,
+                ("raycastManager", raycastManager), ("planeManager", planeManager),
+                ("placementReticle", reticleObj.GetComponent<PlacementReticle>()), ("battlefieldPrefab", battlefieldPrefab));
+
+            FieldManipulator manipulator = GetOrAdd<FieldManipulator>(originObj);
+            SetProps(manipulator, ("raycastManager", raycastManager));
+
+            // El controlador de luz va en la Directional Light (GDD 11)
+            LightEstimationController oldLightController = originObj.GetComponent<LightEstimationController>();
+            if (oldLightController != null) UnityEngine.Object.DestroyImmediate(oldLightController);
+
+            Light directional = scene.GetRootGameObjects().SelectMany(r => r.GetComponentsInChildren<Light>(true)).FirstOrDefault(l => l.type == LightType.Directional);
+            if (directional == null)
+            {
+                var lightObj = new GameObject("Directional Light");
+                directional = lightObj.AddComponent<Light>();
+                directional.type = LightType.Directional;
+                lightObj.transform.rotation = Quaternion.Euler(50f, -30f, 0f);
+            }
+            LightEstimationController lightController = GetOrAdd<LightEstimationController>(directional.gameObject);
+            SetProps(lightController, ("cameraManager", cameraManager), ("directionalLight", directional));
+
+            // 4. EventSystem con el módulo del Input System
+            EventSystem eventSystem = FindInScene<EventSystem>(scene);
+            if (eventSystem == null)
+            {
+                eventSystem = new GameObject("EventSystem").AddComponent<EventSystem>();
+            }
+            StandaloneInputModule legacyModule = eventSystem.GetComponent<StandaloneInputModule>();
+            if (legacyModule != null) UnityEngine.Object.DestroyImmediate(legacyModule);
+            if (eventSystem.GetComponent<BaseInputModule>() == null)
+            {
+                eventSystem.gameObject.AddComponent<InputSystemUIInputModule>().AssignDefaultActions();
+            }
+
+            // 5. Sistemas del juego
+            var managers = new GameObject("[GameManagers]");
+            managers.AddComponent<GameManager>();
+            ConfigureWaves(managers.AddComponent<WaveSpawner>(), enemies);
+
+            AudioSource music = managers.AddComponent<AudioSource>();
+            music.clip = bgm;
+            music.loop = true;
+            music.playOnAwake = false;
+            music.volume = 0.55f;
+            BeatClock beatClock = managers.AddComponent<BeatClock>();
+            SetProps(beatClock, ("bpm", 120f), ("musicSource", music), ("autoStartOnPlaying", true));
+
+            UltimateController ultimate = managers.AddComponent<UltimateController>();
+            managers.AddComponent<TouchInputRouter>();
+
+            GameObject sfxObj = Empty("SfxSource", managers.transform, Vector3.zero);
+            AudioSource sfxSource = sfxObj.AddComponent<AudioSource>();
+            sfxSource.playOnAwake = false;
+            Sfx sfx = sfxObj.AddComponent<Sfx>();
+            var sfxSo = new SerializedObject(sfx);
+            sfxSo.FindProperty("source").objectReferenceValue = sfxSource;
+            SerializedProperty entries = sfxSo.FindProperty("entries");
+            entries.arraySize = sfxClips.Count;
+            int entryIndex = 0;
+            foreach (KeyValuePair<SfxId, AudioClip> pair in sfxClips)
+            {
+                SerializedProperty entry = entries.GetArrayElementAtIndex(entryIndex++);
+                entry.FindPropertyRelative("id").enumValueIndex = (int)pair.Key;
+                entry.FindPropertyRelative("clip").objectReferenceValue = pair.Value;
+                entry.FindPropertyRelative("volume").floatValue = pair.Key == SfxId.Shoot ? 0.35f : 0.8f;
+            }
+            sfxSo.ApplyModifiedPropertiesWithoutUndo();
+
+            // 6. Interfaz
+            BuildHud(towers, ultimate);
+            BuildWorldSpaceTowerMenu();
+
+            Debug.Log("[ConcertDefense] Objetos raíz de la escena: " + string.Join(", ", scene.GetRootGameObjects().Select(g => g.name)));
+            Debug.Log("[ConcertDefense] XR Origin: " + string.Join(", ", originObj.GetComponents<Component>().Select(c => c.GetType().Name))
+                + " | EventSystem: " + string.Join(", ", eventSystem.GetComponents<Component>().Select(c => c.GetType().Name)));
+
+            EditorSceneManager.MarkSceneDirty(scene);
+            EditorSceneManager.SaveScene(scene);
+
+            if (!EditorBuildSettings.scenes.Any(s => s.path == ScenePath))
+            {
+                EditorBuildSettings.scenes = EditorBuildSettings.scenes.Append(new EditorBuildSettingsScene(ScenePath, true)).ToArray();
+            }
         }
 
-        private static void ConfigureWaves(WaveSpawner ws, Dictionary<string, GameObject> enemies)
+        /// <summary>Busca un componente en la escena, incluidos objetos inactivos.</summary>
+        private static T FindInScene<T>(UnityEngine.SceneManagement.Scene scene) where T : Component
         {
-            var soWS = new SerializedObject(ws);
-            var wavesProp = soWS.FindProperty("waves");
-            wavesProp.arraySize = 4;
-
-            void SetWave(int index, string title, (string enemyKey, int count, float interval)[] groups, string bossKey)
+            foreach (GameObject sceneRoot in scene.GetRootGameObjects())
             {
-                var waveElem = wavesProp.GetArrayElementAtIndex(index);
-                waveElem.FindPropertyRelative("waveTitle").stringValue = title;
-                waveElem.FindPropertyRelative("delayBeforeBoss").floatValue = 3.0f;
+                T found = sceneRoot.GetComponentInChildren<T>(true);
+                if (found != null) return found;
+            }
+            return null;
+        }
 
-                if (!string.IsNullOrEmpty(bossKey) && enemies.ContainsKey(bossKey))
-                {
-                    waveElem.FindPropertyRelative("bossPrefab").objectReferenceValue = enemies[bossKey];
-                }
+        private static T GetOrAdd<T>(GameObject go) where T : Component
+        {
+            T component = go.GetComponent<T>();
+            return component != null ? component : go.AddComponent<T>();
+        }
 
-                var groupsProp = waveElem.FindPropertyRelative("enemyGroups");
+        /// <summary>
+        /// Oleadas del GDD 6.
+        /// </summary>
+        private static void ConfigureWaves(WaveSpawner spawner, Dictionary<string, GameObject> enemies)
+        {
+            var so = new SerializedObject(spawner);
+            SerializedProperty waves = so.FindProperty("waves");
+            waves.arraySize = 4;
+
+            void SetWave(int index, string title, string boss, params (string key, int count, float interval)[] groups)
+            {
+                SerializedProperty wave = waves.GetArrayElementAtIndex(index);
+                wave.FindPropertyRelative("waveTitle").stringValue = title;
+                wave.FindPropertyRelative("delayBeforeBoss").floatValue = 4f;
+                wave.FindPropertyRelative("bossPrefab").objectReferenceValue = enemies[boss];
+
+                SerializedProperty groupsProp = wave.FindPropertyRelative("enemyGroups");
                 groupsProp.arraySize = groups.Length;
                 for (int g = 0; g < groups.Length; g++)
                 {
-                    var groupElem = groupsProp.GetArrayElementAtIndex(g);
-                    groupElem.FindPropertyRelative("groupName").stringValue = $"{groups[g].count}x {groups[g].enemyKey}";
-                    groupElem.FindPropertyRelative("enemyPrefab").objectReferenceValue = enemies[groups[g].enemyKey];
-                    groupElem.FindPropertyRelative("count").intValue = groups[g].count;
-                    groupElem.FindPropertyRelative("spawnInterval").floatValue = groups[g].interval;
+                    SerializedProperty group = groupsProp.GetArrayElementAtIndex(g);
+                    group.FindPropertyRelative("groupName").stringValue = $"{groups[g].count}x {groups[g].key}";
+                    group.FindPropertyRelative("enemyPrefab").objectReferenceValue = enemies[groups[g].key];
+                    group.FindPropertyRelative("count").intValue = groups[g].count;
+                    group.FindPropertyRelative("spawnInterval").floatValue = groups[g].interval;
                 }
             }
 
-            // Oleada 1: Introducción (8x Pixel) -> Boss Distorsión
-            SetWave(0, "Oleada 1: Ruido Blanco", new[] { ("Enemy_Pixel", 8, 1.2f) }, "Boss_Distortion");
+            SetWave(0, "Ruido blanco", "Boss_Distortion", ("Enemy_Pixel", 8, 1.6f));
+            SetWave(1, "Acople", "Boss_Feedback", ("Enemy_Pixel", 10, 1.4f), ("Enemy_Static", 5, 0.9f));
+            SetWave(2, "Enjambre", "Boss_GlitchQueen", ("Enemy_Pixel", 8, 1.2f), ("Enemy_Static", 8, 0.8f), ("Enemy_Amp", 3, 2.5f));
+            SetWave(3, "Mezcla final", "Boss_FinalMix", ("Enemy_Pixel", 10, 1.1f), ("Enemy_Static", 10, 0.7f), ("Enemy_Amp", 5, 2.2f));
 
-            // Oleada 2: Interferencia (6x Static + 4x Pixel) -> Boss Feedback
-            SetWave(1, "Oleada 2: Acople Acústico", new[] { ("Enemy_Static", 6, 1.1f), ("Enemy_Pixel", 4, 0.8f) }, "Boss_Feedback");
-
-            // Oleada 3: Enjambre Masivo (5x Amp + 6x Pixel) -> Boss Reina Glitch
-            SetWave(2, "Oleada 3: Corrupción Glitch", new[] { ("Enemy_Amp", 5, 1.3f), ("Enemy_Pixel", 6, 0.7f) }, "Boss_GlitchQueen");
-
-            // Oleada 4: Mezcla Final (8x Static + 6x Amp) -> Boss Mezcla Final
-            SetWave(3, "Oleada 4: Concierto del Fin del Mundo", new[] { ("Enemy_Static", 8, 0.9f), ("Enemy_Amp", 6, 1.0f) }, "Boss_FinalMix");
-
-            soWS.ApplyModifiedPropertiesWithoutUndo();
+            so.ApplyModifiedPropertiesWithoutUndo();
         }
 
-        private static void BuildUserInterface(Dictionary<TowerType, GameObject> towers)
-        {
-            // Canvas Screen Space
-            GameObject canvasObj = GameObject.Find("ConcertDefense_HUD_Canvas");
-            if (canvasObj == null)
-            {
-                canvasObj = new GameObject("ConcertDefense_HUD_Canvas");
-                Canvas canvas = canvasObj.AddComponent<Canvas>();
-                canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-                CanvasScaler scaler = canvasObj.AddComponent<CanvasScaler>();
-                scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
-                scaler.referenceResolution = new Vector2(1920, 1080);
-                scaler.matchWidthOrHeight = 0.5f;
-                canvasObj.AddComponent<GraphicRaycaster>();
-            }
-            else
-            {
-                CanvasScaler scaler = canvasObj.GetComponent<CanvasScaler>();
-                if (scaler != null) scaler.matchWidthOrHeight = 0.5f;
-
-                // Limpiar cualquier elemento previo para asegurar cero duplicados
-                for (int i = canvasObj.transform.childCount - 1; i >= 0; i--)
-                {
-                    GameObject.DestroyImmediate(canvasObj.transform.GetChild(i).gameObject);
-                }
-            }
-
-            TMP_FontAsset font = AssetDatabase.LoadAssetAtPath<TMP_FontAsset>("Assets/TextMesh Pro/Resources/Fonts & Materials/LiberationSans SDF.asset");
-
-            // --- 1. HUDController ---
-            HUDController hud = canvasObj.GetComponent<HUDController>();
-            if (hud == null) hud = canvasObj.AddComponent<HUDController>();
-
-            // Panel de guía AR
-            GameObject arGuidance = CreatePanel(canvasObj.transform, "AR_GuidancePanel", new Vector2(0.5f, 0.85f), new Vector2(0.5f, 0.85f), new Vector2(0f, 0f), new Vector2(800, 90), new Color(0f, 0f, 0f, 0.75f));
-            TextMeshProUGUI arGuideText = CreateText(arGuidance.transform, "GuideText", "Apunta tu cámara a una mesa o piso para detectar planos...", 26, font, Color.white, TextAlignmentOptions.Center);
-            arGuideText.rectTransform.sizeDelta = new Vector2(760, 70);
-
-            // Gameplay HUD Root (Contenedor transparente SIN componente Image para cero interferencia de raycasts)
-            GameObject gameplayRoot = new GameObject("GameplayHUD_Root");
-            gameplayRoot.transform.SetParent(canvasObj.transform, false);
-            RectTransform grRT = gameplayRoot.AddComponent<RectTransform>();
-            grRT.anchorMin = Vector2.zero;
-            grRT.anchorMax = Vector2.one;
-            grRT.offsetMin = Vector2.zero;
-            grRT.offsetMax = Vector2.zero;
-
-            // Barra Superior de Recursos: se adapta responsive de borde a borde (16:9, móviles o Free Aspect)
-            GameObject topBar = CreatePanel(gameplayRoot.transform, "TopBar", new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0f, -45f), new Vector2(-40f, 75f), new Color(0.08f, 0.08f, 0.14f, 0.88f));
-
-            // Monedas (alineadas a la izquierda con padding)
-            GameObject coinsObj = new GameObject("CoinsText");
-            coinsObj.transform.SetParent(topBar.transform, false);
-            RectTransform coinsRT = coinsObj.AddComponent<RectTransform>();
-            coinsRT.anchorMin = new Vector2(0f, 0.5f);
-            coinsRT.anchorMax = new Vector2(0f, 0.5f);
-            coinsRT.pivot = new Vector2(0f, 0.5f);
-            coinsRT.anchoredPosition = new Vector2(25f, 0f);
-            coinsRT.sizeDelta = new Vector2(200f, 50f);
-            TextMeshProUGUI coinsText = coinsObj.AddComponent<TextMeshProUGUI>();
-            if (font != null) coinsText.font = font;
-            coinsText.text = "150 pts";
-            coinsText.fontSize = 26;
-            coinsText.color = new Color(1f, 0.9f, 0.1f);
-            coinsText.alignment = TextAlignmentOptions.MidlineLeft;
-            coinsText.raycastTarget = false;
-
-            // Slider de Salud del Escenario (centrado)
-            GameObject healthSliderObj = CreateSlider(topBar.transform, "StageHealthSlider", Vector2.zero, new Vector2(340f, 26f), 20f);
-            Slider stageSlider = healthSliderObj.GetComponent<Slider>();
-            RectTransform sliderRT = healthSliderObj.GetComponent<RectTransform>();
-            sliderRT.anchorMin = new Vector2(0.5f, 0.5f);
-            sliderRT.anchorMax = new Vector2(0.5f, 0.5f);
-            sliderRT.pivot = new Vector2(0.5f, 0.5f);
-            sliderRT.anchoredPosition = Vector2.zero;
-            TextMeshProUGUI healthText = CreateText(healthSliderObj.transform, "HealthText", "20 / 20", 18, font, Color.white, TextAlignmentOptions.Center);
-            healthText.raycastTarget = false;
-
-            // Texto de Oleada (anclado a la derecha, NUNCA tapado con padding y sin recorte)
-            GameObject waveObj = new GameObject("WaveText");
-            waveObj.transform.SetParent(topBar.transform, false);
-            RectTransform waveRT = waveObj.AddComponent<RectTransform>();
-            waveRT.anchorMin = new Vector2(1f, 0.5f);
-            waveRT.anchorMax = new Vector2(1f, 0.5f);
-            waveRT.pivot = new Vector2(1f, 0.5f);
-            waveRT.anchoredPosition = new Vector2(-25f, 0f);
-            waveRT.sizeDelta = new Vector2(220f, 50f);
-            TextMeshProUGUI waveText = waveObj.AddComponent<TextMeshProUGUI>();
-            if (font != null) waveText.font = font;
-            waveText.text = "Oleada 1 / 4";
-            waveText.fontSize = 24;
-            waveText.color = new Color(0f, 1f, 0.9f);
-            waveText.alignment = TextAlignmentOptions.MidlineRight;
-            waveText.raycastTarget = false;
-            waveText.textWrappingMode = TextWrappingModes.NoWrap;
-            waveText.overflowMode = TextOverflowModes.Overflow;
-
-            // Botón Iniciar Oleada (con texto sin raycast para garantizar clic instantáneo)
-            GameObject startWaveBtnObj = CreateButton(gameplayRoot.transform, "StartWaveButton", new Vector2(0.5f, 0.08f), new Vector2(0.5f, 0.08f), Vector2.zero, new Vector2(320, 80), new Color(0f, 0.85f, 0.75f));
-            TextMeshProUGUI startWaveLabel = CreateText(startWaveBtnObj.transform, "Label", "INICIAR OLEADA", 28, font, Color.black, TextAlignmentOptions.Center);
-            startWaveLabel.raycastTarget = false;
-            Button startWaveBtn = startWaveBtnObj.GetComponent<Button>();
-
-            // Barra de Jefe (Oculta por defecto)
-            GameObject bossBar = CreatePanel(gameplayRoot.transform, "BossBarContainer", new Vector2(0.5f, 0.92f), new Vector2(0.5f, 0.92f), Vector2.zero, new Vector2(850, 70), new Color(0.2f, 0.05f, 0.1f, 0.9f));
-            TextMeshProUGUI bossTitleText = CreateText(bossBar.transform, "BossNameText", "JEFE: Distorsión", 24, font, new Color(1f, 0.2f, 0.6f), TextAlignmentOptions.Top);
-            bossTitleText.rectTransform.anchoredPosition = new Vector2(0f, 12f);
-            GameObject bossSliderObj = CreateSlider(bossBar.transform, "BossHealthSlider", new Vector2(0f, -12f), new Vector2(750f, 22f), 600f);
-            Slider bossSlider = bossSliderObj.GetComponent<Slider>();
-            bossBar.SetActive(false);
-
-            // Fin de Partida: Game Over & Victoria
-            GameObject gameOverPanel = CreatePanel(canvasObj.transform, "GameOverPanel", new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(700, 420), new Color(0.12f, 0.02f, 0.05f, 0.95f));
-            CreateText(gameOverPanel.transform, "Title", "¡CONCIERTO ARRUINADO!\n<size=60%>El Ánimo del escenario ha caído a 0</size>", 36, font, new Color(1f, 0.2f, 0.3f), TextAlignmentOptions.Center);
-            GameObject restartGOverBtn = CreateButton(gameOverPanel.transform, "RestartButton", new Vector2(0.5f, 0.25f), new Vector2(0.5f, 0.25f), Vector2.zero, new Vector2(260, 65), new Color(1f, 0.3f, 0.4f));
-            CreateText(restartGOverBtn.transform, "Label", "REINTENTAR", 26, font, Color.white, TextAlignmentOptions.Center);
-            gameOverPanel.SetActive(false);
-
-            GameObject victoryPanel = CreatePanel(canvasObj.transform, "VictoryPanel", new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(700, 420), new Color(0.02f, 0.12f, 0.08f, 0.95f));
-            CreateText(victoryPanel.transform, "Title", "¡CONCIERTO SALVADO!\n<size=60%>Todos los Glitches y Jefes han sido purificados</size>", 36, font, new Color(0f, 1f, 0.6f), TextAlignmentOptions.Center);
-            GameObject restartVicBtn = CreateButton(victoryPanel.transform, "RestartButton", new Vector2(0.5f, 0.25f), new Vector2(0.5f, 0.25f), Vector2.zero, new Vector2(260, 65), new Color(0f, 0.9f, 0.5f));
-            CreateText(restartVicBtn.transform, "Label", "VOLVER A JUGAR", 26, font, Color.black, TextAlignmentOptions.Center);
-            victoryPanel.SetActive(false);
-
-            // Hook a HUDController
-            var soHUD = new SerializedObject(hud);
-            soHUD.FindProperty("arGuidancePanel").objectReferenceValue = arGuidance;
-            soHUD.FindProperty("arGuidanceText").objectReferenceValue = arGuideText;
-            soHUD.FindProperty("gameplayHudRoot").objectReferenceValue = gameplayRoot;
-            soHUD.FindProperty("coinsText").objectReferenceValue = coinsText;
-            soHUD.FindProperty("stageHealthText").objectReferenceValue = healthText;
-            soHUD.FindProperty("stageHealthSlider").objectReferenceValue = stageSlider;
-            soHUD.FindProperty("waveText").objectReferenceValue = waveText;
-            soHUD.FindProperty("startWaveButton").objectReferenceValue = startWaveBtn;
-            soHUD.FindProperty("bossBarContainer").objectReferenceValue = bossBar;
-            soHUD.FindProperty("bossNameText").objectReferenceValue = bossTitleText;
-            soHUD.FindProperty("bossHealthSlider").objectReferenceValue = bossSlider;
-            soHUD.FindProperty("gameOverPanel").objectReferenceValue = gameOverPanel;
-            soHUD.FindProperty("restartGameOverButton").objectReferenceValue = restartGOverBtn.GetComponent<Button>();
-            soHUD.FindProperty("victoryPanel").objectReferenceValue = victoryPanel;
-            soHUD.FindProperty("restartVictoryButton").objectReferenceValue = restartVicBtn.GetComponent<Button>();
-            soHUD.ApplyModifiedPropertiesWithoutUndo();
-
-            // --- 2. RhythmInput UI ---
-            RhythmInput ri = canvasObj.GetComponent<RhythmInput>();
-            if (ri == null) ri = canvasObj.AddComponent<RhythmInput>();
-
-            GameObject beatBtnObj = CreateButton(gameplayRoot.transform, "BeatButton", new Vector2(0.9f, 0.16f), new Vector2(0.9f, 0.16f), Vector2.zero, new Vector2(130, 130), new Color(0.9f, 0.1f, 0.6f));
-            CreateText(beatBtnObj.transform, "BeatLabel", "BEAT\n♪", 28, font, Color.white, TextAlignmentOptions.Center);
-
-            GameObject pulseRingObj = CreatePanel(beatBtnObj.transform, "PulseRing", new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(160, 160), Color.clear);
-            Image ringImg = pulseRingObj.GetComponent<Image>();
-            ringImg.color = new Color(0f, 1f, 0.9f, 0.6f);
-
-            TextMeshProUGUI feedbackText = CreateText(gameplayRoot.transform, "RhythmFeedbackText", "", 42, font, Color.cyan, TextAlignmentOptions.Center);
-            feedbackText.rectTransform.anchoredPosition = new Vector2(580f, -220f);
-
-            TextMeshProUGUI comboText = CreateText(gameplayRoot.transform, "ComboText", "", 32, font, Color.yellow, TextAlignmentOptions.Center);
-            comboText.rectTransform.anchoredPosition = new Vector2(580f, -320f);
-
-            var soRI = new SerializedObject(ri);
-            soRI.FindProperty("beatButton").objectReferenceValue = beatBtnObj.GetComponent<Button>();
-            soRI.FindProperty("pulseRing").objectReferenceValue = pulseRingObj.GetComponent<RectTransform>();
-            soRI.FindProperty("feedbackText").objectReferenceValue = feedbackText;
-            soRI.FindProperty("comboText").objectReferenceValue = comboText;
-            soRI.ApplyModifiedPropertiesWithoutUndo();
-
-            // --- 3. UltimateController UI ---
-            UltimateController uc = GameObject.Find("[GameManagers]").GetComponent<UltimateController>();
-            GameObject ultBtnObj = CreateButton(gameplayRoot.transform, "UltimateButton", new Vector2(0.1f, 0.16f), new Vector2(0.1f, 0.16f), Vector2.zero, new Vector2(130, 130), new Color(0.2f, 0.7f, 1f));
-            CreateText(ultBtnObj.transform, "UltLabel", "ULTIMATE\n★", 22, font, Color.white, TextAlignmentOptions.Center);
-            Image fillImg = ultBtnObj.GetComponent<Image>();
-            fillImg.type = Image.Type.Filled;
-            fillImg.fillMethod = Image.FillMethod.Radial360;
-
-            var soUC = new SerializedObject(uc);
-            soUC.FindProperty("ultimateButton").objectReferenceValue = ultBtnObj.GetComponent<Button>();
-            soUC.FindProperty("chargeFillImage").objectReferenceValue = fillImg;
-            soUC.ApplyModifiedPropertiesWithoutUndo();
-
-            // --- 4. TowerSelectorUI ---
-            TowerSelectorUI ts = canvasObj.GetComponent<TowerSelectorUI>();
-            if (ts == null) ts = canvasObj.AddComponent<TowerSelectorUI>();
-
-            GameObject selectorRoot = CreatePanel(canvasObj.transform, "TowerSelector_Panel", new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(960, 480), new Color(0.08f, 0.08f, 0.14f, 0.95f));
-            CreateText(selectorRoot.transform, "Header", "SELECCIONA UNA CANTANTE DEFENSIVA", 32, font, new Color(0f, 1f, 0.9f), TextAlignmentOptions.Top);
-
-            GameObject closeSelectorBtn = CreateButton(selectorRoot.transform, "CloseButton", new Vector2(0.95f, 0.92f), new Vector2(0.95f, 0.92f), Vector2.zero, new Vector2(45, 45), new Color(0.8f, 0.2f, 0.2f));
-            CreateText(closeSelectorBtn.transform, "X", "X", 24, font, Color.white, TextAlignmentOptions.Center);
-
-            var soTS = new SerializedObject(ts);
-            soTS.FindProperty("panelRoot").objectReferenceValue = selectorRoot;
-            soTS.FindProperty("closeButton").objectReferenceValue = closeSelectorBtn.GetComponent<Button>();
-
-            var cardsProp = soTS.FindProperty("towerCards");
-            cardsProp.arraySize = 4;
-
-            (TowerType type, string name, int cost, Color color, float posX)[] cardDefs = {
-                (TowerType.Bass, "Bass", 50, new Color(0f, 0.8f, 0.9f), -330f),
-                (TowerType.Treble, "Treble", 40, new Color(1f, 0.85f, 0.1f), -110f),
-                (TowerType.Echo, "Echo", 60, new Color(0.9f, 0.1f, 0.6f), 110f),
-                (TowerType.Drop, "Drop", 80, new Color(0.7f, 0.2f, 1f), 330f)
-            };
-
-            for (int i = 0; i < cardDefs.Length; i++)
-            {
-                var cardData = cardDefs[i];
-                GameObject cardObj = CreatePanel(selectorRoot.transform, $"Card_{cardData.name}", new Vector2(0.5f, 0.45f), new Vector2(0.5f, 0.45f), new Vector2(cardData.posX, -15f), new Vector2(195, 300), new Color(0.14f, 0.14f, 0.22f));
-
-                CreateText(cardObj.transform, "Title", cardData.name, 26, font, cardData.color, TextAlignmentOptions.Top);
-
-                GameObject buyBtn = CreateButton(cardObj.transform, "BuyButton", new Vector2(0.5f, 0.2f), new Vector2(0.5f, 0.2f), Vector2.zero, new Vector2(160, 50), cardData.color);
-                CreateText(buyBtn.transform, "BtnLabel", "CONSTRUIR", 18, font, Color.black, TextAlignmentOptions.Center);
-
-                TextMeshProUGUI costTxt = CreateText(cardObj.transform, "Cost", $"{cardData.cost} pts", 22, font, Color.yellow, TextAlignmentOptions.Bottom);
-                costTxt.rectTransform.anchoredPosition = new Vector2(0f, 15f);
-
-                var elem = cardsProp.GetArrayElementAtIndex(i);
-                elem.FindPropertyRelative("type").enumValueIndex = (int)cardData.type;
-                elem.FindPropertyRelative("characterName").stringValue = cardData.name;
-                elem.FindPropertyRelative("cost").intValue = cardData.cost;
-                elem.FindPropertyRelative("towerPrefab").objectReferenceValue = towers[cardData.type];
-                elem.FindPropertyRelative("cardButton").objectReferenceValue = buyBtn.GetComponent<Button>();
-                elem.FindPropertyRelative("costText").objectReferenceValue = costTxt;
-            }
-
-            soTS.ApplyModifiedPropertiesWithoutUndo();
-            selectorRoot.SetActive(false);
-
-            // --- 5. World Space TowerMenu ---
-            BuildWorldSpaceTowerMenu(font);
-        }
-
-        private static void BuildWorldSpaceTowerMenu(TMP_FontAsset font)
-        {
-            GameObject menuCanvas = GameObject.Find("WorldSpace_TowerMenu");
-            if (menuCanvas == null)
-            {
-                menuCanvas = new GameObject("WorldSpace_TowerMenu");
-                Canvas canvas = menuCanvas.AddComponent<Canvas>();
-                canvas.renderMode = RenderMode.WorldSpace;
-                canvas.GetComponent<RectTransform>().sizeDelta = new Vector2(400, 320);
-                canvas.transform.localScale = Vector3.one * 0.0018f;
-                menuCanvas.AddComponent<GraphicRaycaster>();
-            }
-
-            UIFollow follow = menuCanvas.GetComponent<UIFollow>();
-            if (follow == null) follow = menuCanvas.AddComponent<UIFollow>();
-
-            TowerMenu tm = menuCanvas.GetComponent<TowerMenu>();
-            if (tm == null) tm = menuCanvas.AddComponent<TowerMenu>();
-
-            GameObject root = CreatePanel(menuCanvas.transform, "MenuRoot", Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero, new Color(0.08f, 0.08f, 0.14f, 0.92f));
-
-            TextMeshProUGUI title = CreateText(root.transform, "TowerName", "Bass Tower", 32, font, Color.cyan, TextAlignmentOptions.Top);
-            title.rectTransform.anchoredPosition = new Vector2(0f, -25f);
-
-            TextMeshProUGUI level = CreateText(root.transform, "LevelText", "Nivel: 1/3", 26, font, Color.white, TextAlignmentOptions.Center);
-            level.rectTransform.anchoredPosition = new Vector2(0f, 20f);
-
-            GameObject upgBtn = CreateButton(root.transform, "UpgradeButton", new Vector2(0.28f, 0.28f), new Vector2(0.28f, 0.28f), Vector2.zero, new Vector2(160, 55), new Color(0f, 0.8f, 0.5f));
-            TextMeshProUGUI upgTxt = CreateText(upgBtn.transform, "Label", "Mejorar (60 pts)", 18, font, Color.black, TextAlignmentOptions.Center);
-
-            GameObject sellBtn = CreateButton(root.transform, "SellButton", new Vector2(0.72f, 0.28f), new Vector2(0.72f, 0.28f), Vector2.zero, new Vector2(160, 55), new Color(0.9f, 0.4f, 0.1f));
-            TextMeshProUGUI sellTxt = CreateText(sellBtn.transform, "Label", "Vender (+30 pts)", 18, font, Color.black, TextAlignmentOptions.Center);
-
-            GameObject closeBtn = CreateButton(root.transform, "CloseButton", new Vector2(0.93f, 0.92f), new Vector2(0.93f, 0.92f), Vector2.zero, new Vector2(35, 35), Color.red);
-            CreateText(closeBtn.transform, "X", "X", 22, font, Color.white, TextAlignmentOptions.Center);
-
-            var soTM = new SerializedObject(tm);
-            soTM.FindProperty("menuRoot").objectReferenceValue = root;
-            soTM.FindProperty("uiFollow").objectReferenceValue = follow;
-            soTM.FindProperty("towerNameText").objectReferenceValue = title;
-            soTM.FindProperty("levelText").objectReferenceValue = level;
-            soTM.FindProperty("upgradeCostText").objectReferenceValue = upgTxt;
-            soTM.FindProperty("sellRefundText").objectReferenceValue = sellTxt;
-            soTM.FindProperty("upgradeButton").objectReferenceValue = upgBtn.GetComponent<Button>();
-            soTM.FindProperty("sellButton").objectReferenceValue = sellBtn.GetComponent<Button>();
-            soTM.FindProperty("closeButton").objectReferenceValue = closeBtn.GetComponent<Button>();
-            soTM.ApplyModifiedPropertiesWithoutUndo();
-
-            root.SetActive(false);
-        }
-
-        private static GameObject CreatePanel(Transform parent, string name, Vector2 minAnchor, Vector2 maxAnchor, Vector2 pos, Vector2 size, Color color)
-        {
-            GameObject obj = new GameObject(name);
-            obj.transform.SetParent(parent, false);
-            RectTransform rt = obj.AddComponent<RectTransform>();
-            rt.anchorMin = minAnchor;
-            rt.anchorMax = maxAnchor;
-            rt.anchoredPosition = pos;
-            rt.sizeDelta = size;
-            Image img = obj.AddComponent<Image>();
-            img.color = color;
-            if (color == Color.clear)
-            {
-                img.raycastTarget = false;
-            }
-            return obj;
-        }
-
-        private static GameObject CreateButton(Transform parent, string name, Vector2 minAnchor, Vector2 maxAnchor, Vector2 pos, Vector2 size, Color color)
-        {
-            GameObject obj = CreatePanel(parent, name, minAnchor, maxAnchor, pos, size, color);
-            obj.AddComponent<Button>();
-            return obj;
-        }
-
-        private static TextMeshProUGUI CreateText(Transform parent, string name, string content, float fontSize, TMP_FontAsset font, Color color, TextAlignmentOptions alignment)
-        {
-            GameObject obj = new GameObject(name);
-            obj.transform.SetParent(parent, false);
-            RectTransform rt = obj.AddComponent<RectTransform>();
-            rt.anchorMin = Vector2.zero;
-            rt.anchorMax = Vector2.one;
-            rt.offsetMin = Vector2.zero;
-            rt.offsetMax = Vector2.zero;
-            TextMeshProUGUI tmp = obj.AddComponent<TextMeshProUGUI>();
-            if (font != null) tmp.font = font;
-            tmp.text = content;
-            tmp.fontSize = fontSize;
-            tmp.color = color;
-            tmp.alignment = alignment;
-            tmp.raycastTarget = false; // Desactivar raycastTarget en texto para no bloquear clics de botones padre
-            return tmp;
-        }
-
-        private static GameObject CreateSlider(Transform parent, string name, Vector2 pos, Vector2 size, float maxVal)
-        {
-            GameObject obj = CreatePanel(parent, name, new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f), pos, size, new Color(0.2f, 0.2f, 0.25f));
-            Slider slider = obj.AddComponent<Slider>();
-
-            GameObject fillArea = CreatePanel(obj.transform, "Fill Area", Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero, Color.clear);
-            var fillAreaImg = fillArea.GetComponent<Image>();
-            if (fillAreaImg != null) fillAreaImg.raycastTarget = false;
-
-            GameObject fill = CreatePanel(fillArea.transform, "Fill", Vector2.zero, Vector2.one, Vector2.zero, Vector2.zero, new Color(0f, 1f, 0.6f));
-            var fillImg = fill.GetComponent<Image>();
-            if (fillImg != null) fillImg.raycastTarget = false;
-
-            slider.fillRect = fill.GetComponent<RectTransform>();
-            slider.maxValue = maxVal;
-            slider.value = maxVal;
-            return obj;
-        }
-
-        [MenuItem("ConcertDefense/Clean Canvas and Rebuild UI", priority = 2)]
-        public static void CleanAndRebuildUI()
-        {
-            Debug.Log("[ConcertDefense] Limpiando Canvas y reconstruyendo UI responsive...");
-
-            // Eliminar Object Spawner del template AR para evitar que aparezcan cubos azules al hacer clic
-            GameObject spawner = GameObject.Find("Object Spawner");
-            if (spawner != null)
-            {
-                GameObject.DestroyImmediate(spawner);
-            }
-
-            var towers = LoadTowerPrefabs();
-            BuildUserInterface(towers);
-            EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
-            EditorSceneManager.SaveScene(EditorSceneManager.GetActiveScene());
-            Debug.Log("<color=#00FF88><b>[ConcertDefense] ¡Canvas limpiado y HUD reconstruido con éxito sin duplicados!</b></color>");
-        }
-
-        private static Dictionary<TowerType, GameObject> LoadTowerPrefabs()
-        {
-            var dict = new Dictionary<TowerType, GameObject>();
-            dict[TowerType.Bass] = AssetDatabase.LoadAssetAtPath<GameObject>($"{PREFABS_PATH}/Towers/Tower_Bass.prefab");
-            dict[TowerType.Treble] = AssetDatabase.LoadAssetAtPath<GameObject>($"{PREFABS_PATH}/Towers/Tower_Treble.prefab");
-            dict[TowerType.Echo] = AssetDatabase.LoadAssetAtPath<GameObject>($"{PREFABS_PATH}/Towers/Tower_Echo.prefab");
-            dict[TowerType.Drop] = AssetDatabase.LoadAssetAtPath<GameObject>($"{PREFABS_PATH}/Towers/Tower_Drop.prefab");
-            return dict;
-        }
         #endregion
-    }
 
-    /// <summary>
-    /// Limpiador automático que detecta si el Canvas tiene elementos duplicados tras una compilación y los repara.
-    /// </summary>
-    [InitializeOnLoad]
-    public static class AutoCanvasCleaner
-    {
-        static AutoCanvasCleaner()
+        #region Interfaz
+
+        private static RectTransform UIRect(string name, Transform parent, Vector2 anchorMin, Vector2 anchorMax, Vector2 pivot, Vector2 anchoredPos, Vector2 sizeDelta)
         {
-            EditorApplication.delayCall += CheckAndCleanCanvasDuplicates;
+            var go = new GameObject(name, typeof(RectTransform));
+            go.layer = 5; // UI
+            var rect = (RectTransform)go.transform;
+            rect.SetParent(parent, false);
+            rect.anchorMin = anchorMin;
+            rect.anchorMax = anchorMax;
+            rect.pivot = pivot;
+            rect.anchoredPosition = anchoredPos;
+            rect.sizeDelta = sizeDelta;
+            return rect;
         }
 
-        private static void CheckAndCleanCanvasDuplicates()
+        private static Image UIImage(RectTransform rect, Color color, Sprite sprite, bool raycastTarget)
         {
-            GameObject canvasObj = GameObject.Find("ConcertDefense_HUD_Canvas");
-            if (canvasObj == null) return;
+            Image image = rect.gameObject.AddComponent<Image>();
+            image.color = color;
+            image.sprite = sprite;
+            if (sprite != null && sprite == roundedSprite) image.type = Image.Type.Sliced;
+            image.raycastTarget = raycastTarget;
+            return image;
+        }
 
-            int guidanceCount = 0;
-            int gameplayCount = 0;
-            foreach (Transform t in canvasObj.transform)
+        private static TextMeshProUGUI UIText(RectTransform rect, string content, float size, Color color, TextAlignmentOptions alignment)
+        {
+            TextMeshProUGUI text = rect.gameObject.AddComponent<TextMeshProUGUI>();
+            if (font != null) text.font = font;
+            text.text = content;
+            text.fontSize = size;
+            text.color = color;
+            text.alignment = alignment;
+            text.fontStyle = FontStyles.Bold;
+            text.raycastTarget = false;
+            return text;
+        }
+
+        /// <summary>Texto que ocupa todo el padre, con un margen.</summary>
+        private static TextMeshProUGUI UILabel(string name, Transform parent, string content, float size, Color color, TextAlignmentOptions alignment, float padding = 6f)
+        {
+            RectTransform rect = UIRect(name, parent, Vector2.zero, Vector2.one, new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(-padding * 2f, -padding * 2f));
+            return UIText(rect, content, size, color, alignment);
+        }
+
+        private static Button UIButton(RectTransform rect, Color color, Sprite sprite, string label, float fontSize, Color labelColor, out TextMeshProUGUI labelText)
+        {
+            Image image = UIImage(rect, color, sprite, true);
+            Button button = rect.gameObject.AddComponent<Button>();
+            button.targetGraphic = image;
+
+            ColorBlock colors = button.colors;
+            colors.highlightedColor = new Color(0.92f, 0.92f, 0.92f, 1f);
+            colors.pressedColor = new Color(0.7f, 0.7f, 0.7f, 1f);
+            colors.disabledColor = new Color(0.45f, 0.45f, 0.5f, 0.7f);
+            button.colors = colors;
+
+            labelText = UILabel("Label", rect, label, fontSize, labelColor, TextAlignmentOptions.Center);
+            return button;
+        }
+
+        /// <summary>Barra con relleno anclado (sin Slider): devuelve el RectTransform del relleno.</summary>
+        private static RectTransform UIBar(RectTransform rect, Color background, Color fillColor)
+        {
+            UIImage(rect, background, roundedSprite, false);
+            RectTransform area = UIRect("FillArea", rect, Vector2.zero, Vector2.one, new Vector2(0.5f, 0.5f), Vector2.zero, new Vector2(-6f, -6f));
+            RectTransform fill = UIRect("Fill", area, Vector2.zero, Vector2.one, new Vector2(0.5f, 0.5f), Vector2.zero, Vector2.zero);
+            UIImage(fill, fillColor, null, false);
+            return fill;
+        }
+
+        private static void BuildHud(TowerDef[] towers, UltimateController ultimate)
+        {
+            var center = new Vector2(0.5f, 0.5f);
+
+            var canvasObj = new GameObject("ConcertDefense_HUD_Canvas", typeof(RectTransform)) { layer = 5 };
+            Canvas canvas = canvasObj.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            canvas.sortingOrder = 10;
+            CanvasScaler scaler = canvasObj.AddComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(1280f, 720f);
+            scaler.matchWidthOrHeight = 0.5f;
+            canvasObj.AddComponent<GraphicRaycaster>();
+            Transform root = canvasObj.transform;
+
+            // ---------- HUD de juego: siempre visible ----------
+            RectTransform gameplay = UIRect("GameplayHUD_Root", root, Vector2.zero, Vector2.one, center, Vector2.zero, Vector2.zero);
+
+            RectTransform topBar = UIRect("TopBar", gameplay, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -10f), new Vector2(-28f, 60f));
+            UIImage(topBar, PanelColor, roundedSprite, false);
+
+            RectTransform coinsRT = UIRect("CoinsText", topBar, new Vector2(0f, 0f), new Vector2(0f, 1f), new Vector2(0f, 0.5f), new Vector2(22f, 0f), new Vector2(300f, 0f));
+            TextMeshProUGUI coinsText = UIText(coinsRT, "MONEDAS  <b>150</b>", 26f, new Color(1f, 0.88f, 0.25f), TextAlignmentOptions.MidlineLeft);
+
+            RectTransform healthBar = UIRect("StageHealthBar", topBar, center, center, center, Vector2.zero, new Vector2(360f, 36f));
+            RectTransform healthFill = UIBar(healthBar, new Color(0.12f, 0.14f, 0.2f, 1f), Turquoise);
+            TextMeshProUGUI healthText = UILabel("HealthText", healthBar, "ÁNIMO  20 / 20", 20f, Color.white, TextAlignmentOptions.Center, 2f);
+
+            RectTransform waveRT = UIRect("WaveText", topBar, new Vector2(1f, 0f), new Vector2(1f, 1f), new Vector2(1f, 0.5f), new Vector2(-22f, 0f), new Vector2(300f, 0f));
+            TextMeshProUGUI waveText = UIText(waveRT, "OLEADA  - / 4", 26f, Turquoise, TextAlignmentOptions.MidlineRight);
+
+            // Botón Iniciar oleada
+            RectTransform startRT = UIRect("StartWaveButton", gameplay, new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0f, 22f), new Vector2(340f, 78f));
+            Button startButton = UIButton(startRT, Turquoise, roundedSprite, "INICIAR OLEADA", 28f, Ink, out TextMeshProUGUI startLabel);
+
+            // Botón Reubicar
+            RectTransform relocateRT = UIRect("RelocateButton", gameplay, new Vector2(0f, 1f), new Vector2(0f, 1f), new Vector2(0f, 1f), new Vector2(14f, -80f), new Vector2(170f, 44f));
+            Button relocateButton = UIButton(relocateRT, new Color(0.16f, 0.2f, 0.3f, 0.92f), roundedSprite, "REUBICAR", 18f, White, out _);
+
+            // Botón Ultimate con medidor
+            RectTransform ultGlow = UIRect("UltimateReadyGlow", gameplay, Vector2.zero, Vector2.zero, Vector2.zero, new Vector2(26f, 26f), new Vector2(170f, 170f));
+            UIImage(ultGlow, new Color(0f, 1f, 0.95f, 0.55f), roundedSprite, false);
+            RectTransform ultRT = UIRect("UltimateButton", gameplay, Vector2.zero, Vector2.zero, Vector2.zero, new Vector2(36f, 36f), new Vector2(150f, 150f));
+            Image ultImage = UIImage(ultRT, new Color(0.1f, 0.13f, 0.2f, 0.95f), roundedSprite, true);
+            Button ultButton = ultRT.gameObject.AddComponent<Button>();
+            ultButton.targetGraphic = ultImage;
+            RectTransform ultArea = UIRect("ChargeArea", ultRT, Vector2.zero, Vector2.one, center, Vector2.zero, new Vector2(-12f, -12f));
+            RectTransform ultFill = UIRect("ChargeFill", ultArea, Vector2.zero, new Vector2(1f, 0f), center, Vector2.zero, Vector2.zero);
+            UIImage(ultFill, new Color(1f, 0.15f, 0.6f, 0.85f), null, false);
+            TextMeshProUGUI ultLabel = UILabel("Label", ultRT, "ULTIMATE\n0%", 20f, Color.white, TextAlignmentOptions.Center);
+            SetProps(ultimate, ("ultimateButton", ultButton), ("chargeFill", ultFill), ("chargeLabel", ultLabel), ("readyVisualEffect", ultGlow.gameObject));
+
+            // Botón Beat con anillo de pulso
+            var bottomRight = new Vector2(1f, 0f);
+            RectTransform ringRT = UIRect("BeatPulseRing", gameplay, bottomRight, bottomRight, center, new Vector2(-111f, 111f), new Vector2(150f, 150f));
+            UIImage(ringRT, new Color(0f, 1f, 0.95f, 0.35f), circleSprite, false);
+            RectTransform beatRT = UIRect("BeatButton", gameplay, bottomRight, bottomRight, center, new Vector2(-111f, 111f), new Vector2(150f, 150f));
+            Button beatButton = UIButton(beatRT, Magenta, circleSprite, "BEAT", 32f, Color.white, out _);
+
+            RectTransform feedbackRT = UIRect("RhythmFeedbackText", gameplay, bottomRight, bottomRight, new Vector2(1f, 0f), new Vector2(-24f, 196f), new Vector2(280f, 46f));
+            TextMeshProUGUI feedbackText = UIText(feedbackRT, "", 34f, Turquoise, TextAlignmentOptions.MidlineRight);
+            RectTransform comboRT = UIRect("ComboText", gameplay, bottomRight, bottomRight, new Vector2(1f, 0f), new Vector2(-24f, 242f), new Vector2(280f, 40f));
+            TextMeshProUGUI comboText = UIText(comboRT, "", 26f, new Color(1f, 0.88f, 0.25f), TextAlignmentOptions.MidlineRight);
+
+            RhythmInput rhythm = canvasObj.AddComponent<RhythmInput>();
+            SetProps(rhythm, ("beatButton", beatButton), ("pulseRing", ringRT), ("feedbackText", feedbackText), ("comboText", comboText));
+
+            // Barra de jefe
+            RectTransform bossBar = UIRect("BossBarContainer", gameplay, new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -80f), new Vector2(540f, 40f));
+            RectTransform bossFill = UIBar(bossBar, new Color(0.18f, 0.04f, 0.1f, 0.95f), Magenta);
+            TextMeshProUGUI bossName = UILabel("BossNameText", bossBar, "JEFE", 20f, Color.white, TextAlignmentOptions.Center, 2f);
+            bossBar.gameObject.SetActive(false);
+
+            // ---------- Paneles eventuales ----------
+            RectTransform guidance = UIRect("AR_GuidancePanel", root, new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -132f), new Vector2(820f, 56f));
+            UIImage(guidance, PanelColor, roundedSprite, false);
+            TextMeshProUGUI guidanceText = UILabel("GuideText", guidance, "Mueve el teléfono despacio apuntando a una mesa o al piso para detectar la superficie.", 20f, Color.white, TextAlignmentOptions.Center);
+            guidanceText.fontStyle = FontStyles.Normal;
+
+            RectTransform toast = UIRect("ToastPanel", root, new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0f, 116f), new Vector2(760f, 50f));
+            UIImage(toast, new Color(0.03f, 0.04f, 0.08f, 0.9f), roundedSprite, false);
+            TextMeshProUGUI toastText = UILabel("ToastText", toast, "", 20f, new Color(0.7f, 1f, 0.97f), TextAlignmentOptions.Center);
+            toastText.fontStyle = FontStyles.Normal;
+            toast.gameObject.SetActive(false);
+
+            // Selector de torres con tarjetas
+            RectTransform selector = UIRect("TowerSelector_Panel", root, center, center, center, Vector2.zero, new Vector2(900f, 430f));
+            UIImage(selector, new Color(0.05f, 0.07f, 0.12f, 0.96f), roundedSprite, true);
+            RectTransform headerRT = UIRect("Header", selector, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -14f), new Vector2(-120f, 44f));
+            UIText(headerRT, "ELIGE UNA TORRE-CANTANTE", 28f, Turquoise, TextAlignmentOptions.Center);
+            RectTransform closeRT = UIRect("CloseButton", selector, Vector2.one, Vector2.one, Vector2.one, new Vector2(-12f, -12f), new Vector2(54f, 54f));
+            Button closeSelector = UIButton(closeRT, new Color(0.8f, 0.15f, 0.3f), roundedSprite, "X", 26f, Color.white, out _);
+
+            TowerSelectorUI selectorUI = canvasObj.AddComponent<TowerSelectorUI>();
+            var selectorSo = new SerializedObject(selectorUI);
+            selectorSo.FindProperty("panelRoot").objectReferenceValue = selector.gameObject;
+            selectorSo.FindProperty("closeButton").objectReferenceValue = closeSelector;
+            SerializedProperty cards = selectorSo.FindProperty("towerCards");
+            cards.arraySize = towers.Length;
+
+            for (int i = 0; i < towers.Length; i++)
             {
-                if (t.name == "AR_GuidancePanel") guidanceCount++;
-                if (t.name == "GameplayHUD_Root") gameplayCount++;
+                TowerDef def = towers[i];
+                float x = (i - (towers.Length - 1) * 0.5f) * 212f;
+
+                RectTransform card = UIRect($"Card_{def.name}", selector, center, center, center, new Vector2(x, -26f), new Vector2(198f, 320f));
+                Image cardImage = UIImage(card, new Color(0.13f, 0.16f, 0.25f, 1f), roundedSprite, true);
+                Button cardButton = card.gameObject.AddComponent<Button>();
+                cardButton.targetGraphic = cardImage;
+                ColorBlock cardColors = cardButton.colors;
+                cardColors.disabledColor = new Color(0.4f, 0.4f, 0.45f, 0.55f);
+                cardButton.colors = cardColors;
+
+                // Retrato: bloque con los colores de la cantante (sustituible por un sprite anime propio)
+                RectTransform portrait = UIRect("Portrait", card, new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -12f), new Vector2(170f, 130f));
+                UIImage(portrait, def.dress == Ink ? new Color(0.02f, 0.03f, 0.06f) : def.dress, roundedSprite, false);
+                RectTransform hairRT = UIRect("Hair", portrait, center, center, center, new Vector2(0f, 8f), new Vector2(104f, 104f));
+                UIImage(hairRT, def.hair, circleSprite, false);
+                RectTransform faceRT = UIRect("Face", portrait, center, center, center, new Vector2(0f, -4f), new Vector2(74f, 74f));
+                UIImage(faceRT, Skin, circleSprite, false);
+                RectTransform tailL = UIRect("TwinTail_L", portrait, center, center, center, new Vector2(-62f, -14f), new Vector2(22f, 86f));
+                UIImage(tailL, def.hair, roundedSprite, false);
+                RectTransform tailR = UIRect("TwinTail_R", portrait, center, center, center, new Vector2(62f, -14f), new Vector2(22f, 86f));
+                UIImage(tailR, def.hair, roundedSprite, false);
+
+                RectTransform nameRT = UIRect("Name", card, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -148f), new Vector2(0f, 36f));
+                UIText(nameRT, def.name.ToUpperInvariant(), 26f, def.hair == White ? Turquoise : def.hair, TextAlignmentOptions.Center);
+                RectTransform descRT = UIRect("Description", card, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -186f), new Vector2(-12f, 56f));
+                TextMeshProUGUI desc = UIText(descRT, def.description, 17f, White, TextAlignmentOptions.Center);
+                desc.fontStyle = FontStyles.Normal;
+
+                RectTransform costBg = UIRect("CostTag", card, new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0f, 14f), new Vector2(150f, 46f));
+                UIImage(costBg, new Color(1f, 0.88f, 0.25f), roundedSprite, false);
+                TextMeshProUGUI costText = UILabel("Cost", costBg, def.cost.ToString(), 26f, Ink, TextAlignmentOptions.Center, 2f);
+
+                SerializedProperty element = cards.GetArrayElementAtIndex(i);
+                element.FindPropertyRelative("type").enumValueIndex = (int)def.type;
+                element.FindPropertyRelative("characterName").stringValue = def.name;
+                element.FindPropertyRelative("cost").intValue = def.cost;
+                element.FindPropertyRelative("towerPrefab").objectReferenceValue = def.prefab;
+                element.FindPropertyRelative("cardButton").objectReferenceValue = cardButton;
+                element.FindPropertyRelative("costText").objectReferenceValue = costText;
+            }
+            selectorSo.ApplyModifiedPropertiesWithoutUndo();
+            selector.gameObject.SetActive(false);
+
+            // Game Over y Victoria
+            Button BuildEndPanel(string name, string title, string subtitle, Color titleColor, string buttonLabel, out GameObject panel)
+            {
+                RectTransform overlay = UIRect(name, root, Vector2.zero, Vector2.one, center, Vector2.zero, Vector2.zero);
+                UIImage(overlay, new Color(0f, 0f, 0f, 0.6f), null, true);
+                RectTransform box = UIRect("Box", overlay, center, center, center, Vector2.zero, new Vector2(640f, 340f));
+                UIImage(box, new Color(0.05f, 0.07f, 0.12f, 0.98f), roundedSprite, false);
+                RectTransform titleRT = UIRect("Title", box, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -40f), new Vector2(-40f, 70f));
+                UIText(titleRT, title, 44f, titleColor, TextAlignmentOptions.Center);
+                RectTransform subRT = UIRect("Subtitle", box, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -118f), new Vector2(-60f, 70f));
+                UIText(subRT, subtitle, 22f, White, TextAlignmentOptions.Center).fontStyle = FontStyles.Normal;
+                RectTransform buttonRT = UIRect("RestartButton", box, new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0.5f, 0f), new Vector2(0f, 36f), new Vector2(300f, 72f));
+                Button button = UIButton(buttonRT, titleColor, roundedSprite, buttonLabel, 26f, Ink, out _);
+                panel = overlay.gameObject;
+                panel.SetActive(false);
+                return button;
             }
 
-            if (guidanceCount > 1 || gameplayCount > 1 || canvasObj.transform.childCount > 10)
+            Button restartGameOver = BuildEndPanel("GameOverPanel", "GAME OVER", "El Ánimo del escenario llegó a 0.\nLos Glitches arruinaron el concierto.", Magenta, "REINICIAR", out GameObject gameOverPanel);
+            Button restartVictory = BuildEndPanel("VictoryPanel", "¡VICTORIA!", "Derrotaste a los cuatro jefes.\nEl concierto está a salvo.", Turquoise, "JUGAR DE NUEVO", out GameObject victoryPanel);
+
+            HUDController hud = canvasObj.AddComponent<HUDController>();
+            SetProps(hud,
+                ("arGuidancePanel", guidance.gameObject), ("arGuidanceText", guidanceText),
+                ("gameplayHudRoot", gameplay.gameObject), ("coinsText", coinsText), ("stageHealthText", healthText),
+                ("stageHealthFill", healthFill), ("waveText", waveText),
+                ("startWaveButton", startButton), ("startWaveLabel", startLabel), ("relocateButton", relocateButton),
+                ("bossBarContainer", bossBar.gameObject), ("bossNameText", bossName), ("bossHealthFill", bossFill),
+                ("toastPanel", toast.gameObject), ("toastText", toastText),
+                ("gameOverPanel", gameOverPanel), ("restartGameOverButton", restartGameOver),
+                ("victoryPanel", victoryPanel), ("restartVictoryButton", restartVictory));
+        }
+
+        private static void BuildWorldSpaceTowerMenu()
+        {
+            var center = new Vector2(0.5f, 0.5f);
+
+            var menuObj = new GameObject("WorldSpace_TowerMenu", typeof(RectTransform)) { layer = 5 };
+            Canvas canvas = menuObj.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.WorldSpace;
+            canvas.sortingOrder = 5;
+            menuObj.AddComponent<GraphicRaycaster>();
+            var menuRT = (RectTransform)menuObj.transform;
+            menuRT.sizeDelta = new Vector2(420f, 250f);
+            menuRT.localScale = Vector3.one * 0.001f;
+
+            UIFollow follow = menuObj.AddComponent<UIFollow>();
+            SetProps(follow, ("destroyWithTarget", false), ("keepConstantScreenSize", true), ("sizeMultiplier", 0.0007f), ("lockYAxisOnly", false));
+
+            RectTransform rootRT = UIRect("MenuRoot", menuRT, Vector2.zero, Vector2.one, center, Vector2.zero, Vector2.zero);
+            UIImage(rootRT, new Color(0.05f, 0.07f, 0.12f, 0.95f), roundedSprite, true);
+
+            RectTransform nameRT = UIRect("TowerName", rootRT, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -10f), new Vector2(-120f, 46f));
+            TextMeshProUGUI nameText = UIText(nameRT, "Bass", 36f, Turquoise, TextAlignmentOptions.Center);
+            RectTransform levelRT = UIRect("LevelText", rootRT, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -58f), new Vector2(-20f, 34f));
+            TextMeshProUGUI levelText = UIText(levelRT, "Nivel 1 / 3", 26f, White, TextAlignmentOptions.Center);
+            RectTransform statsRT = UIRect("StatsText", rootRT, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0.5f, 1f), new Vector2(0f, -94f), new Vector2(-20f, 30f));
+            TextMeshProUGUI statsText = UIText(statsRT, "Daño 34   Alcance 50", 22f, new Color(0.7f, 1f, 0.97f), TextAlignmentOptions.Center);
+            statsText.fontStyle = FontStyles.Normal;
+
+            RectTransform upgradeRT = UIRect("UpgradeButton", rootRT, new Vector2(0f, 0f), new Vector2(0f, 0f), new Vector2(0f, 0f), new Vector2(16f, 16f), new Vector2(186f, 92f));
+            Button upgradeButton = UIButton(upgradeRT, Turquoise, roundedSprite, "MEJORAR\n60", 24f, Ink, out TextMeshProUGUI upgradeText);
+            RectTransform sellRT = UIRect("SellButton", rootRT, new Vector2(1f, 0f), new Vector2(1f, 0f), new Vector2(1f, 0f), new Vector2(-16f, 16f), new Vector2(186f, 92f));
+            Button sellButton = UIButton(sellRT, Magenta, roundedSprite, "VENDER\n+30", 24f, Color.white, out TextMeshProUGUI sellText);
+            RectTransform closeRT = UIRect("CloseButton", rootRT, Vector2.one, Vector2.one, Vector2.one, new Vector2(-8f, -8f), new Vector2(52f, 52f));
+            Button closeButton = UIButton(closeRT, new Color(0.25f, 0.28f, 0.38f), roundedSprite, "X", 26f, Color.white, out _);
+
+            TowerMenu menu = menuObj.AddComponent<TowerMenu>();
+            SetProps(menu,
+                ("menuRoot", rootRT.gameObject), ("uiFollow", follow), ("towerNameText", nameText), ("levelText", levelText),
+                ("statsText", statsText), ("upgradeCostText", upgradeText), ("sellRefundText", sellText),
+                ("upgradeButton", upgradeButton), ("sellButton", sellButton), ("closeButton", closeButton));
+
+            rootRT.gameObject.SetActive(false);
+        }
+
+        #endregion
+
+        #region Ajustes del proyecto
+
+        private static void ApplyProjectSettings()
+        {
+            // El HUD está diseñado en horizontal
+            PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+
+            // La plantilla exigía Android 14 (API 34); se baja a Android 10 para poder instalar en más teléfonos con ARCore
+            int current = (int)PlayerSettings.Android.minSdkVersion;
+            if (current > 29)
             {
-                Debug.LogWarning("[ConcertDefense] Se detectaron elementos duplicados en el Canvas. Reconstruyendo automáticamente...");
-                GameSetupUtility.CleanAndRebuildUI();
+                int[] available = Enum.GetValues(typeof(AndroidSdkVersions)).Cast<int>().Where(v => v >= 29).OrderBy(v => v).ToArray();
+                if (available.Length > 0)
+                {
+                    PlayerSettings.Android.minSdkVersion = (AndroidSdkVersions)available[0];
+                    Debug.Log($"[ConcertDefense] Android minSdkVersion: {current} -> {available[0]}");
+                }
             }
         }
+
+        #endregion
     }
 }
